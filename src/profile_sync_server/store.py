@@ -414,6 +414,21 @@ class ProfileStore:
             )
         return {"revision_id": revision_id}
 
+    def revision(self, revision_id, enrollment_id, access_token):
+        if not isinstance(revision_id, str) or not REVISION.fullmatch(
+            revision_id
+        ):
+            raise NotFound("revision does not exist")
+        with self.connect() as database:
+            self._authenticate(database, enrollment_id, access_token)
+            row = database.execute(
+                "SELECT manifest FROM revisions WHERE revision_id=?",
+                (revision_id,),
+            ).fetchone()
+            if row is None:
+                raise NotFound("revision does not exist")
+            return json.loads(row["manifest"])
+
     def publish_candidate(
         self,
         channel,
