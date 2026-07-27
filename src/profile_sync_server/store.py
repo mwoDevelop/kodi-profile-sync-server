@@ -53,8 +53,21 @@ def revision_identity(manifest):
 
 
 def validate_revision(manifest):
-    if not isinstance(manifest, dict) or manifest.get("schema") != 2:
+    if not isinstance(manifest, dict) or manifest.get("schema") not in {2, 3}:
         raise ValidationError("unsupported revision schema")
+    if manifest["schema"] == 2:
+        if not isinstance(manifest.get("adapters"), dict):
+            raise ValidationError("invalid schema 2 revision")
+    else:
+        base = manifest.get("base")
+        layers = manifest.get("layers")
+        if (
+            not isinstance(base, dict)
+            or set(base) != {"adapters"}
+            or not isinstance(base["adapters"], dict)
+            or not isinstance(layers, list)
+        ):
+            raise ValidationError("invalid schema 3 revision")
     revision_id = manifest.get("revision_id")
     if not isinstance(revision_id, str) or not REVISION.fullmatch(revision_id):
         raise ValidationError("invalid revision id")
