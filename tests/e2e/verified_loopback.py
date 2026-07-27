@@ -119,6 +119,7 @@ def main():
             CHANNEL,
             code="87654321",
             ttl_seconds=300,
+            target_tags=["home", "linux-flatpak:x86_64"],
         )
         port = 18766
         base = "http://127.0.0.1:%d" % port
@@ -163,6 +164,11 @@ def main():
             )
             if status != 200 or paired.get("enrollment_generation") != 1:
                 raise RuntimeError("one-time pairing failed")
+            if paired.get("target_tags") != [
+                "home",
+                "linux-flatpak:x86_64",
+            ]:
+                raise RuntimeError("enrollment target tags were not bound")
             status, heartbeat = request(
                 base,
                 "POST",
@@ -335,6 +341,8 @@ def main():
                 status != 200
                 or active.get("assignment_kind") != "active"
                 or active.get("revision_id") != revision["revision_id"]
+                or active.get("target_tags")
+                != ["home", "linux-flatpak:x86_64"]
             ):
                 raise RuntimeError("active assignment lookup failed")
         finally:

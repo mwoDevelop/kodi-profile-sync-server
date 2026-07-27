@@ -16,6 +16,7 @@ def main():
     pairing.add_argument("--logical-device-id", required=True)
     pairing.add_argument("--channel", required=True)
     pairing.add_argument("--role", action="append", default=["read"])
+    pairing.add_argument("--target-tag", action="append", default=[])
     pairing.add_argument("--ttl-seconds", type=int, default=300)
     revoke = commands.add_parser("revoke")
     revoke.add_argument("enrollment_id")
@@ -29,6 +30,7 @@ def main():
             args.logical_device_id,
             args.channel,
             roles=args.role,
+            target_tags=args.target_tag,
             ttl_seconds=args.ttl_seconds,
         )
     else:
