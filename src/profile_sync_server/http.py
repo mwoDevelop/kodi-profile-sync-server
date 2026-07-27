@@ -62,6 +62,17 @@ class Handler(BaseHTTPRequestHandler):
                 )
             )
             return
+        if (
+            len(parts) == 5
+            and parts[:2] == ["v1", "enrollments"]
+            and parts[3] == "revisions"
+        ):
+            self._dispatch(
+                lambda: self.store.revision(
+                    parts[4], parts[2], self._bearer()
+                )
+            )
+            return
         self._send(404, {"error": "not_found"})
 
     def do_POST(self):

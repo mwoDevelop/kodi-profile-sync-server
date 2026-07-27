@@ -201,6 +201,15 @@ def main():
             )
             if status != 200:
                 raise RuntimeError("signed revision was rejected")
+            status, downloaded = request(
+                base,
+                "GET",
+                "/v1/enrollments/%s/revisions/%s"
+                % (paired["enrollment_id"], revision["revision_id"]),
+                access_token=paired["access_token"],
+            )
+            if status != 200 or downloaded != revision:
+                raise RuntimeError("authenticated revision download failed")
             status, _ = request(
                 base,
                 "POST",
@@ -351,6 +360,7 @@ def main():
                     "signed_promotion": "pass",
                     "one_time_pairing": "pass",
                     "authenticated_heartbeat": "pass",
+                    "authenticated_revision_download": "pass",
                     "authenticated_assignment": "pass",
                     "result": "pass",
                 },

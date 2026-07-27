@@ -174,6 +174,8 @@ def test_pairing_token_heartbeat_and_revocation(tmp_path):
         verify_signed_document=lambda _kind, _document: True,
         bootstrap_keys={"promoter-1": {"allowed_kinds": ["assignment"]}},
     )
+    manifest = revision("authenticated-download")
+    state.put_revision(manifest)
     pairing = state.create_pairing_code(
         "sony-tv",
         CHANNEL,
@@ -203,6 +205,20 @@ def test_pairing_token_heartbeat_and_revocation(tmp_path):
         enrolled["access_token"],
     )
     assert heartbeat["status"] == "ok"
+    assert (
+        state.revision(
+            manifest["revision_id"],
+            enrolled["enrollment_id"],
+            enrolled["access_token"],
+        )
+        == manifest
+    )
+    with pytest.raises(Unauthorized, match="authentication failed"):
+        state.revision(
+            manifest["revision_id"],
+            enrolled["enrollment_id"],
+            "x" * 43,
+        )
     with pytest.raises(Unauthorized, match="pairing rejected"):
         state.pair(
             "12345678",
@@ -220,5 +236,11 @@ def test_pairing_token_heartbeat_and_revocation(tmp_path):
                 "enrollment_generation": 1,
                 "channel": CHANNEL,
             },
+            enrolled["access_token"],
+        )
+    with pytest.raises(Unauthorized, match="authentication failed"):
+        state.revision(
+            manifest["revision_id"],
+            enrolled["enrollment_id"],
             enrolled["access_token"],
         )
