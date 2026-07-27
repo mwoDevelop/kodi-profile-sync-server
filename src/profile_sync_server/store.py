@@ -3,15 +3,22 @@
 from __future__ import annotations
 
 import hashlib
+import hmac
 import json
 import re
+import secrets
 import sqlite3
+import time
 from pathlib import Path
 
 
 CHANNEL = re.compile(r"^[a-z0-9][a-z0-9._-]{0,63}$")
 REVISION = re.compile(r"^sha256:[a-f0-9]{64}$")
 ENROLLMENT = re.compile(r"^enr:[A-Za-z0-9._-]{8,128}$")
+LOGICAL_DEVICE = re.compile(r"^[a-z0-9][a-z0-9._-]{0,63}$")
+PAIRING_CODE = re.compile(r"^[0-9]{8}$")
+KEY_ID = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._:-]{0,127}$")
+ROLES = {"read", "publish"}
 
 
 class ValidationError(ValueError):
@@ -23,6 +30,10 @@ class Conflict(RuntimeError):
 
 
 class NotFound(RuntimeError):
+    pass
+
+
+class Unauthorized(RuntimeError):
     pass
 
 
@@ -55,12 +66,13 @@ def validate_revision(manifest):
 
 
 class ProfileStore:
-    def __init__(self, path, verify_signed_document):
+    def __init__(self, path, verify_signed_document, bootstrap_keys=None):
         if verify_signed_document is None:
             raise ValueError("a signed-document verifier is required")
         self.path = Path(path)
         self.path.parent.mkdir(parents=True, exist_ok=True)
         self.verify_signed_document = verify_signed_document
+        self.bootstrap_keys = bootstrap_keys or {}
         self._migrate()
 
     def connect(self):
@@ -108,8 +120,263 @@ class ProfileStore:
                     operation TEXT NOT NULL,
                     response TEXT NOT NULL
                 );
+                CREATE TABLE IF NOT EXISTS pairing_codes (
+                    code_sha256 TEXT PRIMARY KEY,
+                    logical_device_id TEXT NOT NULL,
+                    channel TEXT NOT NULL,
+                    roles TEXT NOT NULL,
+                    expires_at INTEGER NOT NULL,
+                    attempts_remaining INTEGER NOT NULL,
+                    consumed INTEGER NOT NULL DEFAULT 0
+                );
+                CREATE TABLE IF NOT EXISTS enrollments (
+                    enrollment_id TEXT PRIMARY KEY,
+                    logical_device_id TEXT NOT NULL,
+                    generation INTEGER NOT NULL,
+                    channel TEXT NOT NULL,
+                    roles TEXT NOT NULL,
+                    key_id TEXT NOT NULL UNIQUE,
+                    public_key TEXT NOT NULL,
+                    token_sha256 TEXT NOT NULL,
+                    revoked INTEGER NOT NULL DEFAULT 0,
+                    created_at INTEGER NOT NULL,
+                    last_seen_at INTEGER,
+                    UNIQUE(logical_device_id, generation)
+                );
                 """
             )
+
+    @staticmethod
+    def _token_digest(token):
+        return hashlib.sha256(
+            b"mwo-profile-sync/token/v1\0" + token.encode("ascii")
+        ).hexdigest()
+
+    @staticmethod
+    def _pairing_digest(code):
+        return hashlib.sha256(
+            b"mwo-profile-sync/pairing-code/v1\0" + code.encode("ascii")
+        ).hexdigest()
+
+    @staticmethod
+    def _validate_roles(roles):
+        if (
+            not isinstance(roles, (list, tuple))
+            or not roles
+            or len(roles) != len(set(roles))
+            or any(role not in ROLES for role in roles)
+        ):
+            raise ValidationError("invalid enrollment roles")
+        return sorted(roles)
+
+    def create_pairing_code(
+        self,
+        logical_device_id,
+        channel,
+        roles=("read",),
+        ttl_seconds=300,
+        attempts=5,
+        code=None,
+    ):
+        if not LOGICAL_DEVICE.fullmatch(str(logical_device_id)):
+            raise ValidationError("invalid logical device id")
+        if not CHANNEL.fullmatch(str(channel)):
+            raise ValidationError("invalid channel")
+        roles = self._validate_roles(roles)
+        if (
+            not isinstance(ttl_seconds, int)
+            or ttl_seconds < 30
+            or ttl_seconds > 1800
+        ):
+            raise ValidationError("invalid pairing code TTL")
+        if not isinstance(attempts, int) or attempts < 1 or attempts > 10:
+            raise ValidationError("invalid pairing attempt limit")
+        if code is None:
+            code = "%08d" % secrets.randbelow(100_000_000)
+        if not isinstance(code, str) or not PAIRING_CODE.fullmatch(code):
+            raise ValidationError("invalid pairing code")
+        expires_at = int(time.time()) + ttl_seconds
+        with self.connect() as database:
+            database.execute("BEGIN IMMEDIATE")
+            database.execute(
+                "DELETE FROM pairing_codes WHERE expires_at < ? OR consumed=1",
+                (int(time.time()),),
+            )
+            try:
+                database.execute(
+                    """
+                    INSERT INTO pairing_codes
+                    VALUES (?, ?, ?, ?, ?, ?, 0)
+                    """,
+                    (
+                        self._pairing_digest(code),
+                        logical_device_id,
+                        channel,
+                        canonical_json(roles).decode("utf-8"),
+                        expires_at,
+                        attempts,
+                    ),
+                )
+            except sqlite3.IntegrityError as error:
+                raise Conflict("pairing code collision") from error
+        return {
+            "code": code,
+            "logical_device_id": logical_device_id,
+            "channel": channel,
+            "roles": roles,
+            "expires_at": expires_at,
+        }
+
+    def pair(
+        self,
+        code,
+        logical_device_id,
+        channel,
+        key_id,
+        public_key,
+    ):
+        if not isinstance(code, str) or not PAIRING_CODE.fullmatch(code):
+            raise Unauthorized("pairing rejected")
+        if not LOGICAL_DEVICE.fullmatch(str(logical_device_id)):
+            raise Unauthorized("pairing rejected")
+        if not CHANNEL.fullmatch(str(channel)):
+            raise Unauthorized("pairing rejected")
+        if not isinstance(key_id, str) or not KEY_ID.fullmatch(key_id):
+            raise ValidationError("invalid enrollment key id")
+        from .crypto import _b64url_decode
+
+        _b64url_decode(public_key, 32)
+        now = int(time.time())
+        with self.connect() as database:
+            database.execute("BEGIN IMMEDIATE")
+            pairing = database.execute(
+                "SELECT * FROM pairing_codes WHERE code_sha256=?",
+                (self._pairing_digest(code),),
+            ).fetchone()
+            if (
+                pairing is None
+                or pairing["consumed"]
+                or pairing["expires_at"] < now
+                or pairing["attempts_remaining"] <= 0
+            ):
+                raise Unauthorized("pairing rejected")
+            if (
+                pairing["logical_device_id"] != logical_device_id
+                or pairing["channel"] != channel
+            ):
+                database.execute(
+                    """
+                    UPDATE pairing_codes
+                    SET attempts_remaining=attempts_remaining-1
+                    WHERE code_sha256=?
+                    """,
+                    (self._pairing_digest(code),),
+                )
+                raise Unauthorized("pairing rejected")
+            generation = (
+                database.execute(
+                    """
+                    SELECT COALESCE(MAX(generation), 0) + 1
+                    FROM enrollments WHERE logical_device_id=?
+                    """,
+                    (logical_device_id,),
+                ).fetchone()[0]
+            )
+            enrollment_id = "enr:" + secrets.token_urlsafe(18)
+            access_token = secrets.token_urlsafe(32)
+            roles = json.loads(pairing["roles"])
+            try:
+                database.execute(
+                    """
+                    INSERT INTO enrollments
+                    VALUES (?, ?, ?, ?, ?, ?, ?, ?, 0, ?, NULL)
+                    """,
+                    (
+                        enrollment_id,
+                        logical_device_id,
+                        generation,
+                        channel,
+                        canonical_json(roles).decode("utf-8"),
+                        key_id,
+                        public_key,
+                        self._token_digest(access_token),
+                        now,
+                    ),
+                )
+            except sqlite3.IntegrityError as error:
+                raise Conflict("enrollment key id already exists") from error
+            database.execute(
+                "UPDATE pairing_codes SET consumed=1 WHERE code_sha256=?",
+                (self._pairing_digest(code),),
+            )
+        return {
+            "enrollment_id": enrollment_id,
+            "enrollment_generation": generation,
+            "logical_device_id": logical_device_id,
+            "channel": channel,
+            "roles": roles,
+            "access_token": access_token,
+            "trust": self.bootstrap_keys,
+        }
+
+    def _authenticate(self, database, enrollment_id, access_token, role="read"):
+        if (
+            not isinstance(enrollment_id, str)
+            or not ENROLLMENT.fullmatch(enrollment_id)
+            or not isinstance(access_token, str)
+            or len(access_token) < 32
+        ):
+            raise Unauthorized("authentication failed")
+        enrollment = database.execute(
+            "SELECT * FROM enrollments WHERE enrollment_id=?",
+            (enrollment_id,),
+        ).fetchone()
+        if (
+            enrollment is None
+            or enrollment["revoked"]
+            or not hmac.compare_digest(
+                enrollment["token_sha256"],
+                self._token_digest(access_token),
+            )
+            or role not in json.loads(enrollment["roles"])
+        ):
+            raise Unauthorized("authentication failed")
+        return enrollment
+
+    def heartbeat(self, document, access_token):
+        enrollment_id = document.get("enrollment_id")
+        with self.connect() as database:
+            database.execute("BEGIN IMMEDIATE")
+            enrollment = self._authenticate(
+                database, enrollment_id, access_token
+            )
+            expected = {
+                "logical_device_id": enrollment["logical_device_id"],
+                "enrollment_generation": enrollment["generation"],
+                "channel": enrollment["channel"],
+            }
+            if any(document.get(key) != value for key, value in expected.items()):
+                raise Unauthorized("heartbeat identity mismatch")
+            database.execute(
+                "UPDATE enrollments SET last_seen_at=? WHERE enrollment_id=?",
+                (int(time.time()), enrollment_id),
+            )
+        return {
+            "enrollment_id": enrollment_id,
+            "status": "ok",
+            "revoked": False,
+        }
+
+    def revoke_enrollment(self, enrollment_id):
+        with self.connect() as database:
+            database.execute("BEGIN IMMEDIATE")
+            changed = database.execute(
+                "UPDATE enrollments SET revoked=1 WHERE enrollment_id=?",
+                (enrollment_id,),
+            ).rowcount
+            if not changed:
+                raise NotFound("enrollment does not exist")
+        return {"enrollment_id": enrollment_id, "revoked": True}
 
     def _idempotent(self, database, key, operation, action):
         if not isinstance(key, str) or len(key) < 8:
@@ -335,17 +602,26 @@ class ProfileStore:
                 database, idempotency_key, "promote", action
             )
 
-    def assignment(self, enrollment_id, channel):
+    def assignment(self, enrollment_id, channel, access_token=None):
         with self.connect() as database:
+            if access_token is not None:
+                enrollment = self._authenticate(
+                    database, enrollment_id, access_token
+                )
+                if enrollment["channel"] != channel:
+                    raise Unauthorized("channel mismatch")
             assigned = database.execute(
                 """
-                SELECT revision_id, assignment_kind FROM assignments
+                SELECT revision_id, assignment_kind, document FROM assignments
                 WHERE enrollment_id=? AND channel=?
                 """,
                 (enrollment_id, channel),
             ).fetchone()
             if assigned:
-                return dict(assigned)
+                return {
+                    "assignment_kind": assigned["assignment_kind"],
+                    "document": json.loads(assigned["document"]),
+                }
             current = database.execute(
                 "SELECT active_revision FROM channels WHERE channel=?",
                 (channel,),

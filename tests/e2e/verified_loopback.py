@@ -19,7 +19,7 @@ from profile_sync_server.crypto import (
     public_key_record,
     sign_document,
 )
-from profile_sync_server.store import canonical_json
+from profile_sync_server.store import ProfileStore, canonical_json
 
 
 CHANNEL = "home-stable"
@@ -27,11 +27,19 @@ REVISION_SEED = bytes.fromhex("11" * 32)
 PROMOTER_SEED = bytes.fromhex("22" * 32)
 BLUE_SEED = bytes.fromhex("33" * 32)
 SONY_SEED = bytes.fromhex("44" * 32)
+PAIRED_SEED = bytes.fromhex("55" * 32)
 BLUE = "enr:bluestacks-consumer"
 SONY = "enr:sony-consumer"
 
 
-def request(base, method, path, document=None, idempotency_key=None):
+def request(
+    base,
+    method,
+    path,
+    document=None,
+    idempotency_key=None,
+    access_token=None,
+):
     payload = None
     headers = {}
     if document is not None:
@@ -39,6 +47,8 @@ def request(base, method, path, document=None, idempotency_key=None):
         headers["Content-Type"] = "application/json"
     if idempotency_key is not None:
         headers["Idempotency-Key"] = idempotency_key
+    if access_token is not None:
+        headers["Authorization"] = "Bearer " + access_token
     operation = urllib.request.Request(
         base + path, data=payload, headers=headers, method=method
     )
@@ -99,6 +109,17 @@ def main():
         registry_path = root / "key-registry.json"
         registry_path.write_bytes(canonical_json(registry))
         registry_path.chmod(0o600)
+        database_path = root / "state.sqlite"
+        provisioning = ProfileStore(
+            database_path,
+            verify_signed_document=lambda _kind, _document: False,
+        )
+        provisioning.create_pairing_code(
+            "paired-readonly",
+            CHANNEL,
+            code="87654321",
+            ttl_seconds=300,
+        )
         port = 18766
         base = "http://127.0.0.1:%d" % port
         environment = dict(os.environ)
@@ -109,7 +130,7 @@ def main():
                 "-m",
                 "profile_sync_server.http",
                 "--database",
-                str(root / "state.sqlite"),
+                str(database_path),
                 "--port",
                 str(port),
                 "--key-registry",
@@ -125,6 +146,37 @@ def main():
             health = wait_ready(base, process)
             if health != {"mode": "verified-loopback", "status": "ok"}:
                 raise RuntimeError("server did not enter verified mode")
+            paired_public = public_key_record(
+                PAIRED_SEED, ["report"], backend=backend
+            )["public_key"]
+            status, paired = request(
+                base,
+                "POST",
+                "/v1/pair",
+                {
+                    "code": "87654321",
+                    "logical_device_id": "paired-readonly",
+                    "channel": CHANNEL,
+                    "key_id": "paired-readonly-key",
+                    "public_key": paired_public,
+                },
+            )
+            if status != 200 or paired.get("enrollment_generation") != 1:
+                raise RuntimeError("one-time pairing failed")
+            status, heartbeat = request(
+                base,
+                "POST",
+                "/v1/devices/heartbeat",
+                {
+                    "enrollment_id": paired["enrollment_id"],
+                    "logical_device_id": "paired-readonly",
+                    "enrollment_generation": 1,
+                    "channel": CHANNEL,
+                },
+                access_token=paired["access_token"],
+            )
+            if status != 200 or heartbeat.get("status") != "ok":
+                raise RuntimeError("authenticated heartbeat failed")
 
             identity = {
                 "schema": 2,
@@ -267,7 +319,8 @@ def main():
                 base,
                 "GET",
                 "/v1/enrollments/%s/assignment?channel=%s"
-                % (BLUE, CHANNEL),
+                % (paired["enrollment_id"], CHANNEL),
+                access_token=paired["access_token"],
             )
             if (
                 status != 200
@@ -296,6 +349,9 @@ def main():
                     "signed_revision": "pass",
                     "signed_canary_reports": 2,
                     "signed_promotion": "pass",
+                    "one_time_pairing": "pass",
+                    "authenticated_heartbeat": "pass",
+                    "authenticated_assignment": "pass",
                     "result": "pass",
                 },
                 indent=2,

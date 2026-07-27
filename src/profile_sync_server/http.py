@@ -9,7 +9,13 @@ from pathlib import Path
 from urllib.parse import parse_qs, urlparse
 
 from .crypto import SignedDocumentVerifier
-from .store import Conflict, NotFound, ProfileStore, ValidationError
+from .store import (
+    Conflict,
+    NotFound,
+    ProfileStore,
+    Unauthorized,
+    ValidationError,
+)
 
 
 class Handler(BaseHTTPRequestHandler):
@@ -28,6 +34,15 @@ class Handler(BaseHTTPRequestHandler):
         self.end_headers()
         self.wfile.write(payload)
 
+    def _bearer(self):
+        authorization = self.headers.get("Authorization", "")
+        if not authorization.startswith("Bearer "):
+            raise Unauthorized("authentication failed")
+        token = authorization[7:]
+        if not token:
+            raise Unauthorized("authentication failed")
+        return token
+
     def do_GET(self):
         parsed = urlparse(self.path)
         if parsed.path == "/health":
@@ -42,7 +57,9 @@ class Handler(BaseHTTPRequestHandler):
             query = parse_qs(parsed.query)
             channel = query.get("channel", [""])[0]
             self._dispatch(
-                lambda: self.store.assignment(parts[2], channel)
+                lambda: self.store.assignment(
+                    parts[2], channel, self._bearer()
+                )
             )
             return
         self._send(404, {"error": "not_found"})
@@ -51,7 +68,21 @@ class Handler(BaseHTTPRequestHandler):
         parts = urlparse(self.path).path.strip("/").split("/")
         document = self._json()
         key = self.headers.get("Idempotency-Key", "")
-        if parts == ["v1", "revisions"]:
+        if parts == ["v1", "pair"]:
+            self._dispatch(
+                lambda: self.store.pair(
+                    document["code"],
+                    document["logical_device_id"],
+                    document["channel"],
+                    document["key_id"],
+                    document["public_key"],
+                )
+            )
+        elif parts == ["v1", "devices", "heartbeat"]:
+            self._dispatch(
+                lambda: self.store.heartbeat(document, self._bearer())
+            )
+        elif parts == ["v1", "revisions"]:
             self._dispatch(lambda: self.store.put_revision(document))
         elif len(parts) == 4 and parts[:2] == ["v1", "channels"]:
             channel = parts[2]
@@ -97,6 +128,8 @@ class Handler(BaseHTTPRequestHandler):
             self._send(409, {"error": str(error)})
         except NotFound as error:
             self._send(404, {"error": str(error)})
+        except Unauthorized as error:
+            self._send(401, {"error": str(error)})
         except (KeyError, json.JSONDecodeError) as error:
             self._send(400, {"error": "invalid_request", "detail": str(error)})
 
@@ -107,6 +140,11 @@ class Handler(BaseHTTPRequestHandler):
 def main():
     parser = argparse.ArgumentParser()
     parser.add_argument("--listen", default="127.0.0.1")
+    parser.add_argument(
+        "--allow-non-loopback",
+        action="store_true",
+        help="allow a verified server to listen on a container interface",
+    )
     parser.add_argument("--port", type=int, default=8765)
     parser.add_argument("--database", default="profile-sync-dev.sqlite")
     parser.add_argument(
@@ -119,22 +157,32 @@ def main():
         help="schema 1 JSON registry of trusted Ed25519 public keys",
     )
     args = parser.parse_args()
-    if args.listen not in {"127.0.0.1", "::1"}:
-        raise SystemExit("development server may listen only on loopback")
     if bool(args.unsafe_accept_signatures) == bool(args.key_registry):
         raise SystemExit(
             "choose exactly one of --key-registry or "
             "--unsafe-accept-signatures"
         )
+    if args.listen not in {"127.0.0.1", "::1"} and (
+        not args.allow_non_loopback or args.unsafe_accept_signatures
+    ):
+        raise SystemExit(
+            "non-loopback requires --key-registry and "
+            "--allow-non-loopback"
+        )
     if args.key_registry:
         verifier = SignedDocumentVerifier.from_file(args.key_registry)
         Handler.mode = "verified-loopback"
+        bootstrap_keys = verifier.public_bundle(
+            {"assignment", "promotion", "revision"}
+        )
     else:
         verifier = lambda _kind, _document: True
         Handler.mode = "unsafe-loopback-dev"
+        bootstrap_keys = {}
     Handler.store = ProfileStore(
         Path(args.database),
         verify_signed_document=verifier,
+        bootstrap_keys=bootstrap_keys,
     )
     server = ThreadingHTTPServer((args.listen, args.port), Handler)
     try:

@@ -367,6 +367,26 @@ def sign_document(kind, document, key_id, seed, backend=None):
     return output
 
 
+def verify_document_with_key(
+    kind, document, expected_key_id, public_key, backend=None
+):
+    try:
+        signature = document.get("signature")
+        if not isinstance(signature, dict) or set(signature) != SIGNATURE_FIELDS:
+            return False
+        if (
+            signature["algorithm"] != ALGORITHM
+            or signature["key_id"] != expected_key_id
+        ):
+            return False
+        value = _b64url_decode(signature["value"], 64)
+        return (backend or native_ed25519()).verify(
+            public_key, signed_payload(kind, document), value
+        )
+    except (AttributeError, SignatureFormatError, TypeError, ValueError):
+        return False
+
+
 class SignedDocumentVerifier:
     def __init__(self, keys, backend=None):
         if not isinstance(keys, dict):
@@ -400,6 +420,20 @@ class SignedDocumentVerifier:
                 "enrollment_id": enrollment_id,
             }
 
+    def public_bundle(self, allowed_kinds=None):
+        allowed = set(allowed_kinds or KINDS)
+        return {
+            key_id: {
+                "public_key": _b64url_encode(record["public_key"]),
+                "allowed_kinds": sorted(
+                    record["allowed_kinds"].intersection(allowed)
+                ),
+            }
+            for key_id, record in self.keys.items()
+            if record["allowed_kinds"].intersection(allowed)
+            and record["enrollment_id"] is None
+        }
+
     @classmethod
     def from_file(cls, path, backend=None):
         document = json.loads(Path(path).read_text(encoding="utf-8"))
@@ -429,11 +463,12 @@ class SignedDocumentVerifier:
                 and document.get("enrollment_id") != record["enrollment_id"]
             ):
                 return False
-            value = _b64url_decode(signature["value"], 64)
-            return self.backend.verify(
+            return verify_document_with_key(
+                kind,
+                document,
+                key_id,
                 record["public_key"],
-                signed_payload(kind, document),
-                value,
+                backend=self.backend,
             )
         except (AttributeError, SignatureFormatError, TypeError, ValueError):
             return False

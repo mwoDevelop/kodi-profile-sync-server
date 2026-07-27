@@ -14,6 +14,9 @@ Implemented:
 - native Ed25519 signatures through BoringSSL/OpenSSL;
 - strict domain, role and enrollment binding for signed documents;
 - public-key registry for verified local operation;
+- one-time, TTL-bound pairing codes;
+- per-installation enrollment generation, bearer token and signing key;
+- authenticated heartbeat and assignment lookup;
 - promotion gated by successful reports from required enrollments.
 
 The HTTP process is still intentionally loopback-only. It can run with a
@@ -44,9 +47,23 @@ PYTHONPATH=src python -m profile_sync_server.http \
   --key-registry .local/key-registry.json
 ```
 
+Create a short-lived pairing code from the host:
+
+```bash
+PYTHONPATH=src python -m profile_sync_server.admin \
+  --database .local/state.sqlite \
+  create-pairing \
+  --logical-device-id sony-tv \
+  --channel home-stable
+```
+
+Container builds target both `linux/amd64` and the QNAP-required
+`linux/arm/v7`. The image is not a production release until it has passed the
+device E2E and is referenced by immutable digest.
+
 Remaining production blockers:
 
-- pairing, persistent key registry and revocation;
+- protected admin API and persistent promoter key rotation;
 - authenticated HTTPS deployment;
 - signed promotion/checkpoint event persistence;
 - content-addressed blob upload sessions and GC;

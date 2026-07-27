@@ -5,6 +5,7 @@ import pytest
 from profile_sync_server.store import (
     Conflict,
     ProfileStore,
+    Unauthorized,
     ValidationError,
     canonical_json,
 )
@@ -165,3 +166,59 @@ def test_assignment_and_report_signatures_are_required(tmp_path):
         state.assign_candidate({}, "assign-0001")
     with pytest.raises(ValidationError, match="report signature"):
         state.record_report({}, "report-0001")
+
+
+def test_pairing_token_heartbeat_and_revocation(tmp_path):
+    state = ProfileStore(
+        tmp_path / "state.sqlite",
+        verify_signed_document=lambda _kind, _document: True,
+        bootstrap_keys={"promoter-1": {"allowed_kinds": ["assignment"]}},
+    )
+    pairing = state.create_pairing_code(
+        "sony-tv",
+        CHANNEL,
+        code="12345678",
+        ttl_seconds=60,
+    )
+    assert pairing["code"] == "12345678"
+    enrolled = state.pair(
+        "12345678",
+        "sony-tv",
+        CHANNEL,
+        "sony-device-key",
+        "dQW21pY0MyWT7V8Qt1OH1J__hnMZs5VZFcjFNjkt5oU",
+    )
+
+    assert enrolled["enrollment_generation"] == 1
+    assert enrolled["trust"] == {
+        "promoter-1": {"allowed_kinds": ["assignment"]}
+    }
+    heartbeat = state.heartbeat(
+        {
+            "enrollment_id": enrolled["enrollment_id"],
+            "logical_device_id": "sony-tv",
+            "enrollment_generation": 1,
+            "channel": CHANNEL,
+        },
+        enrolled["access_token"],
+    )
+    assert heartbeat["status"] == "ok"
+    with pytest.raises(Unauthorized, match="pairing rejected"):
+        state.pair(
+            "12345678",
+            "sony-tv",
+            CHANNEL,
+            "other-key",
+            "dQW21pY0MyWT7V8Qt1OH1J__hnMZs5VZFcjFNjkt5oU",
+        )
+    state.revoke_enrollment(enrolled["enrollment_id"])
+    with pytest.raises(Unauthorized, match="authentication failed"):
+        state.heartbeat(
+            {
+                "enrollment_id": enrolled["enrollment_id"],
+                "logical_device_id": "sony-tv",
+                "enrollment_generation": 1,
+                "channel": CHANNEL,
+            },
+            enrolled["access_token"],
+        )
