@@ -33,6 +33,7 @@ def revision(value):
         **identity,
         "revision_id": "sha256:"
         + hashlib.sha256(canonical_json(identity)).hexdigest(),
+        "signature": "test-signature",
     }
 
 
@@ -158,6 +159,8 @@ def test_promotion_requires_signed_success_from_every_canary(tmp_path):
 def test_assignment_and_report_signatures_are_required(tmp_path):
     state = store(tmp_path, verifier=lambda _kind, _document: False)
 
+    with pytest.raises(ValidationError, match="revision signature"):
+        state.put_revision(revision("unsigned-for-verifier"))
     with pytest.raises(ValidationError, match="assignment signature"):
         state.assign_candidate({}, "assign-0001")
     with pytest.raises(ValidationError, match="report signature"):

@@ -130,6 +130,8 @@ class ProfileStore:
         return response
 
     def put_revision(self, manifest):
+        if not self.verify_signed_document("revision", manifest):
+            raise ValidationError("invalid revision signature")
         revision_id = validate_revision(manifest)
         payload = canonical_json(manifest).decode("utf-8")
         with self.connect() as database:

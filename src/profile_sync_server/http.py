@@ -8,11 +8,13 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from urllib.parse import parse_qs, urlparse
 
+from .crypto import SignedDocumentVerifier
 from .store import Conflict, NotFound, ProfileStore, ValidationError
 
 
 class Handler(BaseHTTPRequestHandler):
     store = None
+    mode = "unconfigured"
 
     def _json(self):
         length = int(self.headers.get("Content-Length", "0"))
@@ -29,7 +31,7 @@ class Handler(BaseHTTPRequestHandler):
     def do_GET(self):
         parsed = urlparse(self.path)
         if parsed.path == "/health":
-            self._send(200, {"status": "ok", "mode": "unsafe-loopback-dev"})
+            self._send(200, {"status": "ok", "mode": self.mode})
             return
         parts = parsed.path.strip("/").split("/")
         if (
@@ -112,14 +114,27 @@ def main():
         action="store_true",
         help="development only; never use for QNAP deployment",
     )
+    parser.add_argument(
+        "--key-registry",
+        help="schema 1 JSON registry of trusted Ed25519 public keys",
+    )
     args = parser.parse_args()
     if args.listen not in {"127.0.0.1", "::1"}:
         raise SystemExit("development server may listen only on loopback")
-    if not args.unsafe_accept_signatures:
-        raise SystemExit("a production signature verifier is not implemented")
+    if bool(args.unsafe_accept_signatures) == bool(args.key_registry):
+        raise SystemExit(
+            "choose exactly one of --key-registry or "
+            "--unsafe-accept-signatures"
+        )
+    if args.key_registry:
+        verifier = SignedDocumentVerifier.from_file(args.key_registry)
+        Handler.mode = "verified-loopback"
+    else:
+        verifier = lambda _kind, _document: True
+        Handler.mode = "unsafe-loopback-dev"
     Handler.store = ProfileStore(
         Path(args.database),
-        verify_signed_document=lambda _kind, _document: True,
+        verify_signed_document=verifier,
     )
     server = ThreadingHTTPServer((args.listen, args.port), Handler)
     try:

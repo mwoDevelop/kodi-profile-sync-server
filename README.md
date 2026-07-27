@@ -11,17 +11,21 @@ Implemented:
 - compare-and-swap publication;
 - idempotency keys;
 - exact canary assignments;
-- signed-document verification boundary;
+- native Ed25519 signatures through BoringSSL/OpenSSL;
+- strict domain, role and enrollment binding for signed documents;
+- public-key registry for verified local operation;
 - promotion gated by successful reports from required enrollments.
 
-The HTTP process is intentionally development-only. It refuses non-loopback
-listeners and refuses to start unless `--unsafe-accept-signatures` is passed.
-This flag replaces signature verification and must never be used for QNAP.
+The HTTP process is still intentionally loopback-only. It can run with a
+schema 1 public-key registry or with an explicit unsafe development override.
+The unsafe flag replaces signature verification and must never be used for
+QNAP.
 
 Run tests:
 
 ```bash
 PYTHONPATH=src pytest -q
+PYTHONPATH=src python tests/e2e/verified_loopback.py
 ```
 
 Run the local smoke server:
@@ -32,10 +36,17 @@ PYTHONPATH=src python -m profile_sync_server.http \
   --unsafe-accept-signatures
 ```
 
-Production blockers:
+Run with verified signatures:
 
-- qualified enrollment signing/verifying implementation on Kodi ARMv7/x86;
-- pairing, key registry and revocation;
+```bash
+PYTHONPATH=src python -m profile_sync_server.http \
+  --database .local/state.sqlite \
+  --key-registry .local/key-registry.json
+```
+
+Remaining production blockers:
+
+- pairing, persistent key registry and revocation;
 - authenticated HTTPS deployment;
 - signed promotion/checkpoint event persistence;
 - content-addressed blob upload sessions and GC;
