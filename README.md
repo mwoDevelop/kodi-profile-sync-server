@@ -54,8 +54,15 @@ PYTHONPATH=src python -m profile_sync_server.admin \
   --database .local/state.sqlite \
   create-pairing \
   --logical-device-id sony-tv \
-  --channel home-stable
+  --channel home-stable \
+  --target-tag home \
+  --target-tag android-tv:armeabi-v7a
 ```
+
+Target tags are assigned by the administrator during one-time enrollment. They
+are persisted with the enrollment and a signed candidate assignment must carry
+the same set, so a client cannot select a more privileged profile layer by
+self-reporting different tags.
 
 Container builds target both `linux/amd64` and the QNAP-required
 `linux/arm/v7`. The image is not a production release until it has passed the

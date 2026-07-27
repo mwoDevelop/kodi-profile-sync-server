@@ -18,6 +18,7 @@ ENROLLMENT = re.compile(r"^enr:[A-Za-z0-9._-]{8,128}$")
 LOGICAL_DEVICE = re.compile(r"^[a-z0-9][a-z0-9._-]{0,63}$")
 PAIRING_CODE = re.compile(r"^[0-9]{8}$")
 KEY_ID = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._:-]{0,127}$")
+TARGET_TAG = re.compile(r"^[a-z0-9][a-z0-9._:-]{0,63}$")
 ROLES = {"read", "publish"}
 
 
@@ -125,6 +126,7 @@ class ProfileStore:
                     logical_device_id TEXT NOT NULL,
                     channel TEXT NOT NULL,
                     roles TEXT NOT NULL,
+                    target_tags TEXT NOT NULL DEFAULT '[]',
                     expires_at INTEGER NOT NULL,
                     attempts_remaining INTEGER NOT NULL,
                     consumed INTEGER NOT NULL DEFAULT 0
@@ -138,6 +140,7 @@ class ProfileStore:
                     key_id TEXT NOT NULL UNIQUE,
                     public_key TEXT NOT NULL,
                     token_sha256 TEXT NOT NULL,
+                    target_tags TEXT NOT NULL DEFAULT '[]',
                     revoked INTEGER NOT NULL DEFAULT 0,
                     created_at INTEGER NOT NULL,
                     last_seen_at INTEGER,
@@ -145,6 +148,16 @@ class ProfileStore:
                 );
                 """
             )
+            for table in ("pairing_codes", "enrollments"):
+                columns = {
+                    row["name"]
+                    for row in database.execute(f"PRAGMA table_info({table})")
+                }
+                if "target_tags" not in columns:
+                    database.execute(
+                        f"ALTER TABLE {table} ADD COLUMN "
+                        "target_tags TEXT NOT NULL DEFAULT '[]'"
+                    )
 
     @staticmethod
     def _token_digest(token):
@@ -169,6 +182,20 @@ class ProfileStore:
             raise ValidationError("invalid enrollment roles")
         return sorted(roles)
 
+    @staticmethod
+    def _validate_target_tags(target_tags):
+        if (
+            not isinstance(target_tags, (list, tuple))
+            or len(target_tags) != len(set(target_tags))
+            or len(target_tags) > 16
+            or any(
+                not isinstance(tag, str) or not TARGET_TAG.fullmatch(tag)
+                for tag in target_tags
+            )
+        ):
+            raise ValidationError("invalid enrollment target tags")
+        return sorted(target_tags)
+
     def create_pairing_code(
         self,
         logical_device_id,
@@ -177,12 +204,14 @@ class ProfileStore:
         ttl_seconds=300,
         attempts=5,
         code=None,
+        target_tags=(),
     ):
         if not LOGICAL_DEVICE.fullmatch(str(logical_device_id)):
             raise ValidationError("invalid logical device id")
         if not CHANNEL.fullmatch(str(channel)):
             raise ValidationError("invalid channel")
         roles = self._validate_roles(roles)
+        target_tags = self._validate_target_tags(target_tags)
         if (
             not isinstance(ttl_seconds, int)
             or ttl_seconds < 30
@@ -205,14 +234,17 @@ class ProfileStore:
             try:
                 database.execute(
                     """
-                    INSERT INTO pairing_codes
-                    VALUES (?, ?, ?, ?, ?, ?, 0)
+                    INSERT INTO pairing_codes (
+                        code_sha256, logical_device_id, channel, roles,
+                        target_tags, expires_at, attempts_remaining, consumed
+                    ) VALUES (?, ?, ?, ?, ?, ?, ?, 0)
                     """,
                     (
                         self._pairing_digest(code),
                         logical_device_id,
                         channel,
                         canonical_json(roles).decode("utf-8"),
+                        canonical_json(target_tags).decode("utf-8"),
                         expires_at,
                         attempts,
                     ),
@@ -224,6 +256,7 @@ class ProfileStore:
             "logical_device_id": logical_device_id,
             "channel": channel,
             "roles": roles,
+            "target_tags": target_tags,
             "expires_at": expires_at,
         }
 
@@ -285,11 +318,15 @@ class ProfileStore:
             enrollment_id = "enr:" + secrets.token_urlsafe(18)
             access_token = secrets.token_urlsafe(32)
             roles = json.loads(pairing["roles"])
+            target_tags = self._validate_target_tags(json.loads(pairing["target_tags"]))
             try:
                 database.execute(
                     """
-                    INSERT INTO enrollments
-                    VALUES (?, ?, ?, ?, ?, ?, ?, ?, 0, ?, NULL)
+                    INSERT INTO enrollments (
+                        enrollment_id, logical_device_id, generation, channel,
+                        roles, key_id, public_key, token_sha256, target_tags,
+                        revoked, created_at, last_seen_at
+                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, 0, ?, NULL)
                     """,
                     (
                         enrollment_id,
@@ -300,6 +337,7 @@ class ProfileStore:
                         key_id,
                         public_key,
                         self._token_digest(access_token),
+                        canonical_json(target_tags).decode("utf-8"),
                         now,
                     ),
                 )
@@ -315,6 +353,7 @@ class ProfileStore:
             "logical_device_id": logical_device_id,
             "channel": channel,
             "roles": roles,
+            "target_tags": target_tags,
             "access_token": access_token,
             "trust": self.bootstrap_keys,
         }
@@ -482,6 +521,7 @@ class ProfileStore:
         enrollment = document.get("enrollment_id")
         channel = document.get("channel")
         revision_id = document.get("revision_id")
+        target_tags = self._validate_target_tags(document.get("target_tags", []))
         if not isinstance(enrollment, str) or not ENROLLMENT.fullmatch(enrollment):
             raise ValidationError("invalid enrollment")
         with self.connect() as database:
@@ -494,6 +534,21 @@ class ProfileStore:
                 ).fetchone()
                 if not row or row["candidate_revision"] != revision_id:
                     raise Conflict("assignment does not target current candidate")
+                enrolled = database.execute(
+                    """
+                    SELECT channel, target_tags, revoked
+                    FROM enrollments WHERE enrollment_id=?
+                    """,
+                    (enrollment,),
+                ).fetchone()
+                if enrolled is not None:
+                    if enrolled["revoked"] or enrolled["channel"] != channel:
+                        raise Conflict("assignment enrollment is not eligible")
+                    enrolled_tags = self._validate_target_tags(
+                        json.loads(enrolled["target_tags"])
+                    )
+                    if enrolled_tags != target_tags:
+                        raise Conflict("assignment target tags differ from enrollment")
                 database.execute(
                     """
                     INSERT OR REPLACE INTO assignments
@@ -511,6 +566,7 @@ class ProfileStore:
                     "channel": channel,
                     "revision_id": revision_id,
                     "assignment_kind": "candidate",
+                    "target_tags": target_tags,
                 }
 
             return self._idempotent(
@@ -643,7 +699,12 @@ class ProfileStore:
             ).fetchone()
             if not current or current["active_revision"] is None:
                 raise NotFound("channel has no active revision")
-            return {
+            response = {
                 "revision_id": current["active_revision"],
                 "assignment_kind": "active",
             }
+            if access_token is not None:
+                response["target_tags"] = self._validate_target_tags(
+                    json.loads(enrollment["target_tags"])
+                )
+            return response
