@@ -11,6 +11,8 @@ import sqlite3
 import time
 from pathlib import Path
 
+from .metadata import DATABASE_SCHEMA_VERSION
+
 
 CHANNEL = re.compile(r"^[a-z0-9][a-z0-9._-]{0,63}$")
 REVISION = re.compile(r"^sha256:[a-f0-9]{64}$")
@@ -171,6 +173,25 @@ class ProfileStore:
                         f"ALTER TABLE {table} ADD COLUMN "
                         "target_tags TEXT NOT NULL DEFAULT '[]'"
                     )
+            database.execute(
+                "PRAGMA user_version=%d" % DATABASE_SCHEMA_VERSION
+            )
+
+    def readiness(self):
+        with self.connect() as database:
+            database.execute("SELECT 1").fetchone()
+            schema = int(
+                database.execute("PRAGMA user_version").fetchone()[0]
+            )
+            integrity = database.execute("PRAGMA quick_check").fetchone()[0]
+        if schema != DATABASE_SCHEMA_VERSION:
+            raise RuntimeError("unsupported database schema")
+        if integrity != "ok":
+            raise RuntimeError("database integrity check failed")
+        return {
+            "database": "ready",
+            "database_schema": schema,
+        }
 
     @staticmethod
     def _token_digest(token):

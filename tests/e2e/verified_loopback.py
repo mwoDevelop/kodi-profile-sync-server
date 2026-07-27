@@ -145,8 +145,29 @@ def main():
         )
         try:
             health = wait_ready(base, process)
-            if health != {"mode": "verified-loopback", "status": "ok"}:
+            expected_health = {
+                "api_version": "v1",
+                "database_schema": 2,
+                "mode": "verified-loopback",
+                "service": "kodi-profile-sync-server",
+                "status": "ok",
+            }
+            if (
+                not expected_health.items() <= health.items()
+                or not isinstance(health.get("version"), str)
+                or not health["version"]
+            ):
                 raise RuntimeError("server did not enter verified mode")
+            status, ready = request(base, "GET", "/ready")
+            expected_ready = {
+                "database": "ready",
+                "database_schema": 2,
+                "key_registry": "ready",
+                "mode": "verified-loopback",
+                "status": "ready",
+            }
+            if status != 200 or not expected_ready.items() <= ready.items():
+                raise RuntimeError("server did not become ready")
             paired_public = public_key_record(
                 PAIRED_SEED, ["report"], backend=backend
             )["public_key"]

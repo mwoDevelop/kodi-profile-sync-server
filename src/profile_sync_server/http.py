@@ -4,11 +4,14 @@ from __future__ import annotations
 
 import argparse
 import json
+import os
+import stat
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from urllib.parse import parse_qs, urlparse
 
 from .crypto import SignedDocumentVerifier
+from .metadata import runtime_metadata
 from .store import (
     Conflict,
     NotFound,
@@ -21,6 +24,7 @@ from .store import (
 class Handler(BaseHTTPRequestHandler):
     store = None
     mode = "unconfigured"
+    key_registry_path = None
 
     def _json(self):
         length = int(self.headers.get("Content-Length", "0"))
@@ -46,7 +50,49 @@ class Handler(BaseHTTPRequestHandler):
     def do_GET(self):
         parsed = urlparse(self.path)
         if parsed.path == "/health":
-            self._send(200, {"status": "ok", "mode": self.mode})
+            self._send(
+                200,
+                {
+                    "status": "ok",
+                    "mode": self.mode,
+                    **runtime_metadata(),
+                },
+            )
+            return
+        if parsed.path == "/ready":
+            try:
+                if not self.key_registry_path:
+                    raise RuntimeError(
+                        "verified key registry is not configured"
+                    )
+                registry = Path(self.key_registry_path)
+                registry_stat = registry.stat()
+                if (
+                    not stat.S_ISREG(registry_stat.st_mode)
+                    or not os.access(registry, os.R_OK)
+                ):
+                    raise RuntimeError("key registry is not a readable file")
+                readiness = self.store.readiness()
+            except (OSError, RuntimeError):
+                self._send(
+                    503,
+                    {
+                        "status": "not_ready",
+                        "mode": self.mode,
+                        **runtime_metadata(),
+                    },
+                )
+                return
+            self._send(
+                200,
+                {
+                    "status": "ready",
+                    "mode": self.mode,
+                    "key_registry": "ready",
+                    **runtime_metadata(),
+                    **readiness,
+                },
+            )
             return
         parts = parsed.path.strip("/").split("/")
         if (
@@ -183,12 +229,14 @@ def main():
     if args.key_registry:
         verifier = SignedDocumentVerifier.from_file(args.key_registry)
         Handler.mode = "verified-loopback"
+        Handler.key_registry_path = str(Path(args.key_registry).resolve())
         bootstrap_keys = verifier.public_bundle(
             {"assignment", "promotion", "revision"}
         )
     else:
         verifier = lambda _kind, _document: True
         Handler.mode = "unsafe-loopback-dev"
+        Handler.key_registry_path = None
         bootstrap_keys = {}
     Handler.store = ProfileStore(
         Path(args.database),
