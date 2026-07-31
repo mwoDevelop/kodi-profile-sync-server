@@ -1,7 +1,7 @@
 # kodi-profile-sync-server
 
-Development implementation of the mwoDevelop Kodi profile synchronization
-store and loopback HTTP API.
+Verified implementation of the mwoDevelop Kodi profile synchronization store
+and HTTPS API.
 
 Implemented:
 
@@ -17,12 +17,14 @@ Implemented:
 - one-time, TTL-bound pairing codes;
 - per-installation enrollment generation, bearer token and signing key;
 - authenticated heartbeat and assignment lookup;
-- promotion gated by successful reports from required enrollments.
+- promotion gated by successful reports from required enrollments;
+- TLS 1.2+ required for every non-loopback listener;
+- online, integrity-checked, mode-0600 SQLite backups and offline restore.
 
-The HTTP process is still intentionally loopback-only. It can run with a
-schema 1 public-key registry or with an explicit unsafe development override.
-The unsafe flag replaces signature verification and must never be used for
-QNAP.
+The process can run on loopback for development. A non-loopback listener
+requires a schema 1 public-key registry, explicit opt-in and a TLS certificate
+plus key. The unsafe flag replaces signature verification and is rejected for
+non-loopback operation.
 
 Run tests:
 
@@ -47,6 +49,17 @@ PYTHONPATH=src python -m profile_sync_server.http \
   --key-registry .local/key-registry.json
 ```
 
+Run a production-style TLS listener:
+
+```bash
+PYTHONPATH=src python -m profile_sync_server.http \
+  --listen 0.0.0.0 --allow-non-loopback \
+  --database .local/state.sqlite \
+  --key-registry .local/key-registry.json \
+  --tls-cert .local/tls/server.crt \
+  --tls-key .local/tls/server.key
+```
+
 Create a short-lived pairing code from the host:
 
 ```bash
@@ -64,14 +77,23 @@ are persisted with the enrollment and a signed candidate assignment must carry
 the same set, so a client cannot select a more privileged profile layer by
 self-reporting different tags.
 
+Create an online-consistent backup while the service is running, or restore
+one while the service is stopped and the target database is absent:
+
+```bash
+PYTHONPATH=src python -m profile_sync_server.admin \
+  --database /data/state.sqlite backup \
+  --output /data/backups/state-20260731.sqlite
+PYTHONPATH=src python -m profile_sync_server.admin \
+  --database /data/state.sqlite restore \
+  --input /data/backups/state-20260731.sqlite
+```
+
 Container builds target both `linux/amd64` and the QNAP-required
 `linux/arm/v7`. The image is not a production release until it has passed the
 device E2E and is referenced by immutable digest.
 
-Remaining production blockers:
-
-- protected admin API and persistent promoter key rotation;
-- authenticated HTTPS deployment;
-- signed promotion/checkpoint event persistence;
-- content-addressed blob upload sessions and GC;
-- multi-architecture image and real QNAP ARMv7 smoke.
+Host-only administration remains deliberately outside the network API. Key
+rotation is performed by atomically replacing the read-only registry and
+restarting the container. Profile revisions are small signed JSON documents;
+content-addressed blob upload is not required by the supported profile policy.

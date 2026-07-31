@@ -5,6 +5,7 @@ from __future__ import annotations
 import argparse
 import json
 import os
+import ssl
 import stat
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
@@ -194,6 +195,39 @@ class Handler(BaseHTTPRequestHandler):
         return
 
 
+def transport_mode(
+    *,
+    listen,
+    allow_non_loopback,
+    unsafe_accept_signatures,
+    key_registry,
+    tls_cert,
+    tls_key,
+):
+    if bool(unsafe_accept_signatures) == bool(key_registry):
+        raise SystemExit(
+            "choose exactly one of --key-registry or "
+            "--unsafe-accept-signatures"
+        )
+    if bool(tls_cert) != bool(tls_key):
+        raise SystemExit("provide TLS certificate and key together")
+    non_loopback = listen not in {"127.0.0.1", "::1"}
+    if non_loopback and (
+        not allow_non_loopback or unsafe_accept_signatures
+    ):
+        raise SystemExit(
+            "non-loopback requires --key-registry and "
+            "--allow-non-loopback"
+        )
+    if non_loopback and not tls_cert:
+        raise SystemExit("non-loopback requires TLS certificate and key")
+    if tls_cert:
+        return "verified-tls"
+    if key_registry:
+        return "verified-loopback"
+    return "unsafe-loopback-dev"
+
+
 def main():
     parser = argparse.ArgumentParser()
     parser.add_argument("--listen", default="127.0.0.1")
@@ -213,29 +247,27 @@ def main():
         "--key-registry",
         help="schema 1 JSON registry of trusted Ed25519 public keys",
     )
+    parser.add_argument("--tls-cert", help="PEM TLS certificate chain")
+    parser.add_argument("--tls-key", help="PEM TLS private key")
     args = parser.parse_args()
-    if bool(args.unsafe_accept_signatures) == bool(args.key_registry):
-        raise SystemExit(
-            "choose exactly one of --key-registry or "
-            "--unsafe-accept-signatures"
-        )
-    if args.listen not in {"127.0.0.1", "::1"} and (
-        not args.allow_non_loopback or args.unsafe_accept_signatures
-    ):
-        raise SystemExit(
-            "non-loopback requires --key-registry and "
-            "--allow-non-loopback"
-        )
+    mode = transport_mode(
+        listen=args.listen,
+        allow_non_loopback=args.allow_non_loopback,
+        unsafe_accept_signatures=args.unsafe_accept_signatures,
+        key_registry=args.key_registry,
+        tls_cert=args.tls_cert,
+        tls_key=args.tls_key,
+    )
     if args.key_registry:
         verifier = SignedDocumentVerifier.from_file(args.key_registry)
-        Handler.mode = "verified-loopback"
+        Handler.mode = mode
         Handler.key_registry_path = str(Path(args.key_registry).resolve())
         bootstrap_keys = verifier.public_bundle(
             {"assignment", "promotion", "revision"}
         )
     else:
         verifier = lambda _kind, _document: True
-        Handler.mode = "unsafe-loopback-dev"
+        Handler.mode = mode
         Handler.key_registry_path = None
         bootstrap_keys = {}
     Handler.store = ProfileStore(
@@ -244,6 +276,11 @@ def main():
         bootstrap_keys=bootstrap_keys,
     )
     server = ThreadingHTTPServer((args.listen, args.port), Handler)
+    if args.tls_cert:
+        context = ssl.SSLContext(ssl.PROTOCOL_TLS_SERVER)
+        context.minimum_version = ssl.TLSVersion.TLSv1_2
+        context.load_cert_chain(args.tls_cert, args.tls_key)
+        server.socket = context.wrap_socket(server.socket, server_side=True)
     try:
         server.serve_forever()
     except KeyboardInterrupt:

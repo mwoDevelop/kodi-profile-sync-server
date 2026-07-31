@@ -8,7 +8,7 @@ import json
 from .store import ProfileStore
 
 
-def main():
+def main(argv=None):
     parser = argparse.ArgumentParser()
     parser.add_argument("--database", required=True)
     commands = parser.add_subparsers(dest="command", required=True)
@@ -20,7 +20,15 @@ def main():
     pairing.add_argument("--ttl-seconds", type=int, default=300)
     revoke = commands.add_parser("revoke")
     revoke.add_argument("enrollment_id")
-    args = parser.parse_args()
+    backup = commands.add_parser("backup")
+    backup.add_argument("--output", required=True)
+    restore = commands.add_parser("restore")
+    restore.add_argument("--input", required=True)
+    args = parser.parse_args(argv)
+    if args.command == "restore":
+        result = ProfileStore.restore_backup(args.input, args.database)
+        print(json.dumps(result, indent=2, sort_keys=True))
+        return 0
     store = ProfileStore(
         args.database,
         verify_signed_document=lambda _kind, _document: False,
@@ -33,8 +41,10 @@ def main():
             target_tags=args.target_tag,
             ttl_seconds=args.ttl_seconds,
         )
-    else:
+    elif args.command == "revoke":
         result = store.revoke_enrollment(args.enrollment_id)
+    else:
+        result = store.backup(args.output)
     print(json.dumps(result, indent=2, sort_keys=True))
     return 0
 

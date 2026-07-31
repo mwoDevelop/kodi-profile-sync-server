@@ -1,4 +1,5 @@
 import hashlib
+import os
 import sqlite3
 
 import pytest
@@ -69,6 +70,48 @@ def signed(kind, **values):
 
 def store(tmp_path, verifier=lambda _kind, document: "signature" in document):
     return ProfileStore(tmp_path / "state.sqlite", verifier)
+
+
+def test_online_backup_is_atomic_private_and_integrity_checked(tmp_path):
+    state = store(tmp_path)
+    manifest = revision("backup")
+    state.put_revision(manifest)
+
+    destination = tmp_path / "backups" / "state.sqlite"
+    result = state.backup(destination)
+
+    assert result["bytes"] == destination.stat().st_size
+    assert result["sha256"] == hashlib.sha256(destination.read_bytes()).hexdigest()
+    assert os.stat(destination).st_mode & 0o777 == 0o600
+    with sqlite3.connect(destination) as database:
+        assert database.execute("PRAGMA integrity_check").fetchone()[0] == "ok"
+        assert database.execute(
+            "SELECT COUNT(*) FROM revisions"
+        ).fetchone()[0] == 1
+
+    with pytest.raises(Conflict, match="backup already exists"):
+        state.backup(destination)
+
+
+def test_restore_requires_valid_offline_backup_and_explicit_empty_target(tmp_path):
+    source = store(tmp_path / "source")
+    source.put_revision(revision("restore"))
+    backup = tmp_path / "backup.sqlite"
+    source.backup(backup)
+
+    target_path = tmp_path / "restored" / "state.sqlite"
+    result = ProfileStore.restore_backup(backup, target_path)
+    assert result["sha256"] == hashlib.sha256(target_path.read_bytes()).hexdigest()
+    restored = ProfileStore(target_path, lambda _kind, _document: True)
+    assert restored.readiness()["database_schema"] == 2
+
+    with pytest.raises(Conflict, match="restore target already exists"):
+        ProfileStore.restore_backup(backup, target_path)
+
+    corrupt = tmp_path / "corrupt.sqlite"
+    corrupt.write_bytes(b"not a sqlite database")
+    with pytest.raises(ValidationError, match="backup is not a valid SQLite"):
+        ProfileStore.restore_backup(corrupt, tmp_path / "bad.sqlite")
 
 
 def test_revision_is_immutable_and_digest_verified(tmp_path):

@@ -5,9 +5,11 @@ from __future__ import annotations
 import hashlib
 import hmac
 import json
+import os
 import re
 import secrets
 import sqlite3
+import tempfile
 import time
 from pathlib import Path
 
@@ -192,6 +194,82 @@ class ProfileStore:
             "database": "ready",
             "database_schema": schema,
         }
+
+    @staticmethod
+    def _validated_database(path):
+        path = Path(path)
+        try:
+            with sqlite3.connect(
+                "file:%s?mode=ro" % path.resolve(), uri=True
+            ) as database:
+                integrity = database.execute(
+                    "PRAGMA integrity_check"
+                ).fetchone()[0]
+                version = database.execute("PRAGMA user_version").fetchone()[0]
+        except (OSError, sqlite3.DatabaseError) as error:
+            raise ValidationError(
+                "backup is not a valid SQLite database"
+            ) from error
+        if integrity != "ok" or version != DATABASE_SCHEMA_VERSION:
+            raise ValidationError(
+                "backup is not a valid SQLite database"
+            )
+        return path
+
+    @staticmethod
+    def _publish_database(source, destination, exists_message):
+        destination = Path(destination)
+        destination.parent.mkdir(parents=True, exist_ok=True)
+        if destination.exists():
+            raise Conflict(exists_message)
+        descriptor, temporary_name = tempfile.mkstemp(
+            prefix=".%s." % destination.name,
+            dir=str(destination.parent),
+        )
+        temporary = Path(temporary_name)
+        os.close(descriptor)
+        try:
+            os.chmod(temporary, 0o600)
+            with sqlite3.connect(
+                "file:%s?mode=ro" % Path(source).resolve(), uri=True
+            ) as input_database, sqlite3.connect(temporary) as output_database:
+                input_database.backup(output_database)
+                output_database.execute("PRAGMA journal_mode=DELETE")
+                if (
+                    output_database.execute("PRAGMA integrity_check").fetchone()[0]
+                    != "ok"
+                ):
+                    raise ValidationError(
+                        "backup is not a valid SQLite database"
+                    )
+            ProfileStore._validated_database(temporary)
+            with temporary.open("rb") as handle:
+                os.fsync(handle.fileno())
+            try:
+                os.link(temporary, destination)
+            except FileExistsError as error:
+                raise Conflict(exists_message) from error
+            os.chmod(destination, 0o600)
+        finally:
+            temporary.unlink(missing_ok=True)
+        payload = destination.read_bytes()
+        return {
+            "path": str(destination),
+            "bytes": len(payload),
+            "sha256": hashlib.sha256(payload).hexdigest(),
+        }
+
+    def backup(self, destination):
+        return self._publish_database(
+            self.path, destination, "backup already exists"
+        )
+
+    @classmethod
+    def restore_backup(cls, source, destination):
+        source = cls._validated_database(source)
+        return cls._publish_database(
+            source, destination, "restore target already exists"
+        )
 
     @staticmethod
     def _token_digest(token):

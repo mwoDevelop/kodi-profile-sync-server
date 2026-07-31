@@ -18,7 +18,7 @@ VOLUME ["/data"]
 EXPOSE 8765
 
 HEALTHCHECK --interval=30s --timeout=5s --start-period=10s --retries=3 \
-  CMD ["python", "-c", "import json,urllib.request; assert json.load(urllib.request.urlopen('http://127.0.0.1:8765/ready', timeout=3))['status'] == 'ready'"]
+  CMD ["python", "-c", "import json,ssl,urllib.request; context=ssl._create_unverified_context(); assert json.load(urllib.request.urlopen('https://127.0.0.1:8765/ready', timeout=3, context=context))['status'] == 'ready'"]
 
 ENTRYPOINT ["python", "-m", "profile_sync_server.http"]
-CMD ["--listen", "0.0.0.0", "--allow-non-loopback", "--port", "8765", "--database", "/data/state.sqlite", "--key-registry", "/run/profile-sync/key-registry.json"]
+CMD ["--listen", "0.0.0.0", "--allow-non-loopback", "--port", "8765", "--database", "/data/state.sqlite", "--key-registry", "/run/profile-sync/key-registry.json", "--tls-cert", "/run/profile-sync/tls/server.crt", "--tls-key", "/run/profile-sync/tls/server.key"]
