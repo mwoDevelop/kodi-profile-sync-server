@@ -685,6 +685,84 @@ class ProfileStore:
                 database, idempotency_key, "assign_candidate", action
             )
 
+    def bootstrap_active(self, channel, document, idempotency_key):
+        """Create a signed client-compatible assignment for active state.
+
+        The server never signs assignments.  This operation only accepts an
+        offline-promoter-signed document and constrains it to the exact active
+        revision and an existing eligible enrollment.  The stored assignment
+        remains ``candidate`` for compatibility with released read-only
+        clients, which already require and verify that signed assignment kind.
+        """
+        if not CHANNEL.fullmatch(str(channel)):
+            raise ValidationError("invalid channel")
+        if not self.verify_signed_document("assignment", document):
+            raise ValidationError("invalid assignment signature")
+        enrollment = document.get("enrollment_id")
+        document_channel = document.get("channel")
+        revision_id = document.get("revision_id")
+        target_tags = self._validate_target_tags(document.get("target_tags", []))
+        if not isinstance(enrollment, str) or not ENROLLMENT.fullmatch(enrollment):
+            raise ValidationError("invalid enrollment")
+        if document_channel != channel:
+            raise Conflict("bootstrap assignment channel differs from endpoint")
+        with self.connect() as database:
+            database.execute("BEGIN IMMEDIATE")
+
+            def action():
+                current = database.execute(
+                    "SELECT active_revision FROM channels WHERE channel=?",
+                    (channel,),
+                ).fetchone()
+                if not current or current["active_revision"] != revision_id:
+                    raise Conflict(
+                        "bootstrap assignment does not target active revision"
+                    )
+                enrolled = database.execute(
+                    """
+                    SELECT channel, target_tags, revoked
+                    FROM enrollments WHERE enrollment_id=?
+                    """,
+                    (enrollment,),
+                ).fetchone()
+                if (
+                    enrolled is None
+                    or enrolled["revoked"]
+                    or enrolled["channel"] != channel
+                ):
+                    raise Conflict("bootstrap enrollment is not eligible")
+                enrolled_tags = self._validate_target_tags(
+                    json.loads(enrolled["target_tags"])
+                )
+                if enrolled_tags != target_tags:
+                    raise Conflict(
+                        "bootstrap target tags differ from enrollment"
+                    )
+                database.execute(
+                    """
+                    INSERT OR REPLACE INTO assignments
+                    VALUES (?, ?, ?, 'candidate', ?)
+                    """,
+                    (
+                        enrollment,
+                        channel,
+                        revision_id,
+                        canonical_json(document).decode("utf-8"),
+                    ),
+                )
+                return {
+                    "enrollment_id": enrollment,
+                    "channel": channel,
+                    "revision_id": revision_id,
+                    "assignment_kind": "candidate",
+                    "assignment_source": "active-bootstrap",
+                    "target_tags": target_tags,
+                }
+
+            return self._idempotent(
+                database, idempotency_key, "bootstrap_active", action
+            )
+
     def record_report(self, document, idempotency_key):
         enrollment = document.get("enrollment_id")
         channel = document.get("channel")

@@ -159,6 +159,12 @@ class Handler(BaseHTTPRequestHandler):
                 self._dispatch(
                     lambda: self.store.assign_candidate(document, key)
                 )
+            elif action == "bootstrap-assignments":
+                self._dispatch(
+                    lambda: self.store.bootstrap_active(
+                        channel, document, key
+                    )
+                )
             elif action == "promote":
                 self._dispatch(
                     lambda: self.store.promote(

@@ -11,6 +11,7 @@ Implemented:
 - compare-and-swap publication;
 - idempotency keys;
 - exact canary assignments;
+- offline-signed active bootstrap assignments for newly enrolled devices;
 - native Ed25519 signatures through BoringSSL/OpenSSL;
 - strict domain, role and enrollment binding for signed documents;
 - public-key registry for verified local operation;
@@ -25,6 +26,12 @@ The process can run on loopback for development. A non-loopback listener
 requires a schema 1 public-key registry, explicit opt-in and a TLS certificate
 plus key. The unsafe flag replaces signature verification and is rejected for
 non-loopback operation.
+
+Version 0.2.2 adds
+`POST /v1/channels/{channel}/bootstrap-assignments`. The endpoint accepts only
+an offline-promoter-signed document whose enrollment, channel, target tags and
+revision match an existing eligible enrollment and the channel's exact active
+revision. The server never holds the promoter private key.
 
 Run tests:
 

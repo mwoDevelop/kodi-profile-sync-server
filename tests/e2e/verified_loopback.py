@@ -366,6 +366,65 @@ def main():
                 != ["home", "linux-flatpak:x86_64"]
             ):
                 raise RuntimeError("active assignment lookup failed")
+            bootstrap = sign_document(
+                "assignment",
+                {
+                    "enrollment_id": paired["enrollment_id"],
+                    "channel": CHANNEL,
+                    "revision_id": revision["revision_id"],
+                    "target_tags": ["home", "linux-flatpak:x86_64"],
+                },
+                "promoter-1",
+                PROMOTER_SEED,
+                backend=backend,
+            )
+            status, bootstrapped = request(
+                base,
+                "POST",
+                "/v1/channels/%s/bootstrap-assignments" % CHANNEL,
+                bootstrap,
+                "bootstrap-e2e-0001",
+            )
+            if (
+                status != 200
+                or bootstrapped.get("assignment_source")
+                != "active-bootstrap"
+            ):
+                raise RuntimeError("signed active bootstrap failed")
+            status, assigned = request(
+                base,
+                "GET",
+                "/v1/enrollments/%s/assignment?channel=%s"
+                % (paired["enrollment_id"], CHANNEL),
+                access_token=paired["access_token"],
+            )
+            if (
+                status != 200
+                or assigned.get("assignment_kind") != "candidate"
+                or assigned.get("document") != bootstrap
+            ):
+                raise RuntimeError("bootstrap assignment was not client-compatible")
+            bootstrap_report = sign_document(
+                "report",
+                {
+                    "enrollment_id": paired["enrollment_id"],
+                    "channel": CHANNEL,
+                    "revision_id": revision["revision_id"],
+                    "result": "success",
+                },
+                "paired-readonly-key",
+                PAIRED_SEED,
+                backend=backend,
+            )
+            status, _ = request(
+                base,
+                "POST",
+                "/v1/reports",
+                bootstrap_report,
+                "bootstrap-report-e2e-0001",
+            )
+            if status != 200:
+                raise RuntimeError("signed bootstrap report failed")
         finally:
             process.terminate()
             try:
@@ -391,6 +450,7 @@ def main():
                     "authenticated_heartbeat": "pass",
                     "authenticated_revision_download": "pass",
                     "authenticated_assignment": "pass",
+                    "signed_active_bootstrap": "pass",
                     "result": "pass",
                 },
                 indent=2,
