@@ -4,6 +4,11 @@ import sqlite3
 
 import pytest
 
+from profile_sync_server.crypto import (
+    native_ed25519,
+    public_key_record,
+    sign_document,
+)
 from profile_sync_server.store import (
     Conflict,
     ProfileStore,
@@ -239,6 +244,62 @@ def test_assignment_and_report_signatures_are_required(tmp_path):
         state.assign_candidate({}, "assign-0001")
     with pytest.raises(ValidationError, match="report signature"):
         state.record_report({}, "report-0001")
+
+
+def test_report_is_verified_against_enrollment_key_not_static_registry(
+    tmp_path,
+):
+    backend = native_ed25519()
+    seed = b"r" * 32
+    state = ProfileStore(
+        tmp_path / "state.sqlite",
+        verify_signed_document=lambda _kind, _document: False,
+    )
+    state.create_pairing_code(
+        "bluestacks1", CHANNEL, code="12345678", ttl_seconds=60
+    )
+    enrolled = state.pair(
+        "12345678",
+        "bluestacks1",
+        CHANNEL,
+        "device-report-key",
+        public_key_record(seed, ["report"], backend=backend)["public_key"],
+    )
+    manifest = revision("dynamic-report")
+    state.verify_signed_document = lambda _kind, _document: True
+    state.put_revision(manifest)
+    state.publish_candidate(
+        CHANNEL, manifest["revision_id"], None, None, "publish-0001"
+    )
+    state.assign_candidate(
+        signed(
+            "assignment",
+            enrollment_id=enrolled["enrollment_id"],
+            channel=CHANNEL,
+            revision_id=manifest["revision_id"],
+            target_tags=[],
+        ),
+        "assign-0001",
+    )
+    report = sign_document(
+        "report",
+        {
+            "enrollment_id": enrolled["enrollment_id"],
+            "channel": CHANNEL,
+            "revision_id": manifest["revision_id"],
+            "result": "success",
+        },
+        "device-report-key",
+        seed,
+        backend=backend,
+    )
+
+    assert state.record_report(report, "report-0001")["result"] == "success"
+
+    tampered = dict(report)
+    tampered["result"] = "failure"
+    with pytest.raises(ValidationError, match="report signature"):
+        state.record_report(tampered, "report-0002")
 
 
 def test_pairing_token_heartbeat_and_revocation(tmp_path):
