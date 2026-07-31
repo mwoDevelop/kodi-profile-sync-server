@@ -686,16 +686,34 @@ class ProfileStore:
             )
 
     def record_report(self, document, idempotency_key):
-        if not self.verify_signed_document("report", document):
-            raise ValidationError("invalid report signature")
         enrollment = document.get("enrollment_id")
         channel = document.get("channel")
         revision_id = document.get("revision_id")
         result = document.get("result")
-        if result not in {"success", "failure"}:
-            raise ValidationError("invalid report result")
         with self.connect() as database:
             database.execute("BEGIN IMMEDIATE")
+            from .crypto import decode_public_key, verify_document_with_key
+
+            enrolled = database.execute(
+                """
+                SELECT key_id, public_key, revoked FROM enrollments
+                WHERE enrollment_id=?
+                """,
+                (enrollment,),
+            ).fetchone()
+            if enrolled is None:
+                verified = self.verify_signed_document("report", document)
+            else:
+                verified = not enrolled["revoked"] and verify_document_with_key(
+                    "report",
+                    document,
+                    enrolled["key_id"],
+                    decode_public_key(enrolled["public_key"]),
+                )
+            if not verified:
+                raise ValidationError("invalid report signature")
+            if result not in {"success", "failure"}:
+                raise ValidationError("invalid report result")
 
             def action():
                 assignment = database.execute(

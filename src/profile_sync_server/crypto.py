@@ -367,6 +367,11 @@ def sign_document(kind, document, key_id, seed, backend=None):
     return output
 
 
+def decode_public_key(value):
+    """Decode one canonical Ed25519 public key stored by enrollment."""
+    return _b64url_decode(value, 32)
+
+
 def verify_document_with_key(
     kind, document, expected_key_id, public_key, backend=None
 ):
