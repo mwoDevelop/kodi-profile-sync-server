@@ -447,6 +447,134 @@ def test_assignment_target_tags_are_bound_to_enrollment(tmp_path):
     }
 
 
+def test_signed_active_bootstrap_is_exact_idempotent_and_reportable(tmp_path):
+    device_seed = b"z" * 32
+    device_public_key = public_key_record(
+        device_seed, ["report"], enrollment_id="enr:placeholder"
+    )["public_key"]
+    state = ProfileStore(
+        tmp_path / "state.sqlite",
+        verify_signed_document=lambda _kind, _document: True,
+    )
+    manifest = revision("active-bootstrap")
+    state.put_revision(manifest)
+    state.publish_candidate(
+        CHANNEL, manifest["revision_id"], None, None, "publish-bootstrap"
+    )
+    state.promote(
+        CHANNEL,
+        manifest["revision_id"],
+        None,
+        [],
+        signed("promotion", generation=1),
+        "promote-bootstrap",
+    )
+    state.create_pairing_code(
+        "linux-bootstrap",
+        CHANNEL,
+        code="34567890",
+        ttl_seconds=60,
+        target_tags=["linux-flatpak:x86_64", "home"],
+    )
+    enrolled = state.pair(
+        "34567890",
+        "linux-bootstrap",
+        CHANNEL,
+        "linux-bootstrap-key",
+        device_public_key,
+    )
+    assignment = signed(
+        "assignment",
+        enrollment_id=enrolled["enrollment_id"],
+        channel=CHANNEL,
+        revision_id=manifest["revision_id"],
+        target_tags=["home", "linux-flatpak:x86_64"],
+    )
+
+    first = state.bootstrap_active(CHANNEL, assignment, "bootstrap-0001")
+    retry = state.bootstrap_active(CHANNEL, assignment, "bootstrap-0001")
+
+    assert retry == first
+    assert first["assignment_source"] == "active-bootstrap"
+    assert state.assignment(
+        enrolled["enrollment_id"], CHANNEL, enrolled["access_token"]
+    ) == {"assignment_kind": "candidate", "document": assignment}
+    report = sign_document(
+        "report",
+        {
+            "enrollment_id": enrolled["enrollment_id"],
+            "channel": CHANNEL,
+            "revision_id": manifest["revision_id"],
+            "result": "success",
+        },
+        "linux-bootstrap-key",
+        device_seed,
+    )
+    assert state.record_report(report, "report-bootstrap")["result"] == "success"
+
+
+def test_active_bootstrap_rejects_wrong_scope_tags_and_revocation(tmp_path):
+    state = ProfileStore(
+        tmp_path / "state.sqlite",
+        verify_signed_document=lambda _kind, _document: True,
+    )
+    active = revision("active")
+    stale = revision("stale")
+    state.put_revision(active)
+    state.put_revision(stale)
+    state.publish_candidate(
+        CHANNEL, active["revision_id"], None, None, "publish-active"
+    )
+    state.promote(
+        CHANNEL,
+        active["revision_id"],
+        None,
+        [],
+        signed("promotion", generation=1),
+        "promote-active",
+    )
+    state.create_pairing_code(
+        "bootstrap-scope",
+        CHANNEL,
+        code="45678901",
+        ttl_seconds=60,
+        target_tags=["home"],
+    )
+    enrolled = state.pair(
+        "45678901",
+        "bootstrap-scope",
+        CHANNEL,
+        "bootstrap-scope-key",
+        "dQW21pY0MyWT7V8Qt1OH1J__hnMZs5VZFcjFNjkt5oU",
+    )
+
+    def assignment(**changes):
+        values = {
+            "enrollment_id": enrolled["enrollment_id"],
+            "channel": CHANNEL,
+            "revision_id": active["revision_id"],
+            "target_tags": ["home"],
+        }
+        values.update(changes)
+        return signed("assignment", **values)
+
+    with pytest.raises(Conflict, match="channel differs"):
+        state.bootstrap_active("other-stable", assignment(), "bootstrap-channel")
+    with pytest.raises(Conflict, match="active revision"):
+        state.bootstrap_active(
+            CHANNEL,
+            assignment(revision_id=stale["revision_id"]),
+            "bootstrap-stale",
+        )
+    with pytest.raises(Conflict, match="target tags differ"):
+        state.bootstrap_active(
+            CHANNEL, assignment(target_tags=[]), "bootstrap-tags"
+        )
+    state.revoke_enrollment(enrolled["enrollment_id"])
+    with pytest.raises(Conflict, match="not eligible"):
+        state.bootstrap_active(CHANNEL, assignment(), "bootstrap-revoked")
+
+
 def test_existing_database_migrates_target_tag_columns(tmp_path):
     database_path = tmp_path / "state.sqlite"
     with sqlite3.connect(database_path) as database:
