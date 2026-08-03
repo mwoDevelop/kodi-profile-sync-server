@@ -30,6 +30,20 @@ SONY_SEED = bytes.fromhex("44" * 32)
 PAIRED_SEED = bytes.fromhex("55" * 32)
 BLUE = "enr:bluestacks-consumer"
 SONY = "enr:sony-consumer"
+ADMIN_BASE = None
+ADMIN_REQUESTS = {}
+
+
+def _admin_operation(path):
+    if path == "/v1/revisions":
+        return "put_revision", "publish"
+    action = path.rstrip("/").split("/")[-1]
+    return {
+        "candidates": ("publish_candidate", "publish"),
+        "assignments": ("assign_candidate", "publish"),
+        "bootstrap-assignments": ("bootstrap_active", "publish"),
+        "promote": ("promote", "promote"),
+    }.get(action, (None, None))
 
 
 def request(
@@ -39,7 +53,38 @@ def request(
     document=None,
     idempotency_key=None,
     access_token=None,
+    wrap_admin=True,
 ):
+    operation, role = _admin_operation(path)
+    if wrap_admin and method == "POST" and operation is not None:
+        if ADMIN_BASE is None:
+            raise RuntimeError("admin base is not configured")
+        if not idempotency_key:
+            idempotency_key = "admin-e2e-" + hashlib.sha256(
+                canonical_json(document)
+            ).hexdigest()[:24]
+        cache_key = (operation, idempotency_key)
+        if cache_key not in ADMIN_REQUESTS:
+            now = int(time.time())
+            envelope = {
+                "schema": 1,
+                "actor_role": role,
+                "operation": operation,
+                "idempotency_key": idempotency_key,
+                "nonce": "admin-e2e-nonce-"
+                + hashlib.sha256(idempotency_key.encode()).hexdigest()[:24],
+                "issued_at": now,
+                "expires_at": now + 120,
+                "payload": document,
+            }
+            ADMIN_REQUESTS[cache_key] = sign_document(
+                "admin_" + role,
+                envelope,
+                "promoter-1",
+                PROMOTER_SEED,
+            )
+        document = ADMIN_REQUESTS[cache_key]
+        base = ADMIN_BASE
     payload = None
     headers = {}
     if document is not None:
@@ -75,6 +120,7 @@ def wait_ready(base, process):
 
 
 def main():
+    global ADMIN_BASE
     repository = Path(__file__).resolve().parents[2]
     backend = native_ed25519()
     with tempfile.TemporaryDirectory(
@@ -89,7 +135,12 @@ def main():
                 ),
                 "promoter-1": public_key_record(
                     PROMOTER_SEED,
-                    ["assignment", "promotion"],
+                    [
+                        "admin_promote",
+                        "admin_publish",
+                        "assignment",
+                        "promotion",
+                    ],
                     backend=backend,
                 ),
                 "blue-key": public_key_record(
@@ -122,7 +173,9 @@ def main():
             target_tags=["home", "linux-flatpak:x86_64"],
         )
         port = 18766
+        admin_port = 18767
         base = "http://127.0.0.1:%d" % port
+        ADMIN_BASE = "http://127.0.0.1:%d" % admin_port
         environment = dict(os.environ)
         environment["PYTHONPATH"] = str(repository / "src")
         process = subprocess.Popen(
@@ -134,6 +187,8 @@ def main():
                 str(database_path),
                 "--port",
                 str(port),
+                "--admin-port",
+                str(admin_port),
                 "--key-registry",
                 str(registry_path),
             ],
@@ -147,7 +202,7 @@ def main():
             health = wait_ready(base, process)
             expected_health = {
                 "api_version": "v1",
-                "database_schema": 2,
+                "database_schema": 3,
                 "mode": "verified-loopback",
                 "service": "kodi-profile-sync-server",
                 "status": "ok",
@@ -161,7 +216,7 @@ def main():
             status, ready = request(base, "GET", "/ready")
             expected_ready = {
                 "database": "ready",
-                "database_schema": 2,
+                "database_schema": 3,
                 "key_registry": "ready",
                 "mode": "verified-loopback",
                 "status": "ready",
@@ -223,6 +278,26 @@ def main():
                 REVISION_SEED,
                 backend=backend,
             )
+            status, published = request(
+                base,
+                "POST",
+                "/v1/revisions",
+                revision,
+                "consumer-deny-admin",
+                wrap_admin=False,
+            )
+            if status != 404:
+                raise RuntimeError("consumer listener exposed admin API")
+            status, _ = request(
+                ADMIN_BASE,
+                "POST",
+                "/v1/revisions",
+                revision,
+                "admin-reject-unsigned",
+                wrap_admin=False,
+            )
+            if status != 401:
+                raise RuntimeError("admin listener accepted unsigned request")
             status, _ = request(
                 base, "POST", "/v1/revisions", revision
             )
@@ -237,7 +312,7 @@ def main():
             )
             if status != 200 or downloaded != revision:
                 raise RuntimeError("authenticated revision download failed")
-            status, _ = request(
+            status, published = request(
                 base,
                 "POST",
                 "/v1/channels/%s/candidates" % CHANNEL,
@@ -248,8 +323,14 @@ def main():
                 },
                 "publish-e2e-0001",
             )
-            if status != 200:
-                raise RuntimeError("candidate publish failed")
+            if (
+                status != 200
+                or published.get("candidate_revision")
+                != revision["revision_id"]
+            ):
+                raise RuntimeError(
+                    "candidate publish failed: %s %s" % (status, published)
+                )
 
             invalid_assignment = sign_document(
                 "assignment",
@@ -291,7 +372,7 @@ def main():
                     PROMOTER_SEED,
                     backend=backend,
                 )
-                status, _ = request(
+                status, response = request(
                     base,
                     "POST",
                     "/v1/channels/%s/assignments" % CHANNEL,
@@ -299,7 +380,10 @@ def main():
                     "assign-e2e-%04d" % index,
                 )
                 if status != 200:
-                    raise RuntimeError("signed assignment failed")
+                    raise RuntimeError(
+                        "signed assignment %s failed: %s %s"
+                        % (index, status, response)
+                    )
 
             for index, (enrollment, seed, key_id) in enumerate(
                 assignments, 1

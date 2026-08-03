@@ -21,7 +21,15 @@ from .store import canonical_json
 ALGORITHM = "Ed25519"
 DOMAIN = b"mwo-profile-sync/signed-document/v1\0"
 KEY_ID = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._:-]{0,127}$")
-KINDS = {"assignment", "promotion", "report", "revision"}
+KINDS = {
+    "admin",
+    "admin_promote",
+    "admin_publish",
+    "assignment",
+    "promotion",
+    "report",
+    "revision",
+}
 SIGNATURE_FIELDS = {"algorithm", "key_id", "value"}
 
 

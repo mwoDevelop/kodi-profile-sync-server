@@ -8,6 +8,7 @@ import json
 import os
 import re
 import secrets
+import shutil
 import sqlite3
 import tempfile
 import time
@@ -23,7 +24,41 @@ LOGICAL_DEVICE = re.compile(r"^[a-z0-9][a-z0-9._-]{0,63}$")
 PAIRING_CODE = re.compile(r"^[0-9]{8}$")
 KEY_ID = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._:-]{0,127}$")
 TARGET_TAG = re.compile(r"^[a-z0-9][a-z0-9._:-]{0,63}$")
+ASSIGNMENT_ID = re.compile(r"^sha256:[a-f0-9]{64}$")
+NONCE = re.compile(r"^[A-Za-z0-9._:-]{16,128}$")
 ROLES = {"read", "publish"}
+ASSIGNMENT_KINDS = {"candidate", "active"}
+APPLY_POLICIES = {"observe", "enforce"}
+REPORT_RESULTS = {
+    "success",
+    "failure",
+    "observed",
+    "drift_blocked",
+    "external_dependency_failure",
+}
+ADMIN_ROLE_OPERATIONS = {
+    "publish": {
+        "put_revision",
+        "publish_candidate",
+        "assign_candidate",
+        "bootstrap_active",
+        "put_blob",
+    },
+    "promote": {"promote"},
+    "admin": {
+        "put_revision",
+        "publish_candidate",
+        "assign_candidate",
+        "bootstrap_active",
+        "put_blob",
+        "promote",
+        "revoke_enrollment",
+    },
+}
+BLOB_MEDIA_TYPES = {"image/jpeg", "image/png", "image/webp"}
+MAX_BLOB_BYTES = 8 * 1024 * 1024
+MAX_BLOB_STORE_BYTES = 512 * 1024 * 1024
+MIN_BLOB_DISK_RESERVE = 64 * 1024 * 1024
 
 
 class ValidationError(ValueError):
@@ -48,11 +83,105 @@ def canonical_json(value):
     ).encode("utf-8")
 
 
+def valid_blob_media(payload, media_type):
+    if media_type == "image/png":
+        return payload.startswith(b"\x89PNG\r\n\x1a\n")
+    if media_type == "image/jpeg":
+        return payload.startswith(b"\xff\xd8\xff") and payload.endswith(
+            b"\xff\xd9"
+        )
+    if media_type == "image/webp":
+        return (
+            len(payload) >= 12
+            and payload[:4] == b"RIFF"
+            and payload[8:12] == b"WEBP"
+        )
+    return False
+
+
 def revision_identity(manifest):
     return {
         key: value
         for key, value in manifest.items()
         if key not in {"revision_id", "created_utc", "signature"}
+    }
+
+
+def assignment_identity(document):
+    return {
+        key: value
+        for key, value in document.items()
+        if key not in {"assignment_id", "signature"}
+    }
+
+
+def validate_assignment_v2(
+    document, expected_kind=None, now=None, validate_time=True
+):
+    if not isinstance(document, dict) or document.get("schema") != 2:
+        raise ValidationError("unsupported assignment schema")
+    assignment_id = document.get("assignment_id")
+    if not isinstance(assignment_id, str) or not ASSIGNMENT_ID.fullmatch(
+        assignment_id
+    ):
+        raise ValidationError("invalid assignment id")
+    expected_id = "sha256:" + hashlib.sha256(
+        canonical_json(assignment_identity(document))
+    ).hexdigest()
+    if assignment_id != expected_id:
+        raise ValidationError("assignment digest mismatch")
+    enrollment_id = document.get("enrollment_id")
+    if not isinstance(enrollment_id, str) or not ENROLLMENT.fullmatch(
+        enrollment_id
+    ):
+        raise ValidationError("invalid enrollment")
+    if not isinstance(document.get("enrollment_generation"), int) or document[
+        "enrollment_generation"
+    ] < 1:
+        raise ValidationError("invalid enrollment generation")
+    if not CHANNEL.fullmatch(str(document.get("channel", ""))):
+        raise ValidationError("invalid channel")
+    if not isinstance(document.get("channel_generation"), int) or document[
+        "channel_generation"
+    ] < 0:
+        raise ValidationError("invalid channel generation")
+    if not REVISION.fullmatch(str(document.get("revision_id", ""))):
+        raise ValidationError("invalid revision id")
+    kind = document.get("assignment_kind")
+    if kind not in ASSIGNMENT_KINDS or (
+        expected_kind is not None and kind != expected_kind
+    ):
+        raise ValidationError("invalid assignment kind")
+    if document.get("apply_policy") not in APPLY_POLICIES:
+        raise ValidationError("invalid assignment apply policy")
+    nonce = document.get("nonce")
+    if not isinstance(nonce, str) or not NONCE.fullmatch(nonce):
+        raise ValidationError("invalid assignment nonce")
+    issued_at = document.get("issued_at")
+    expires_at = document.get("expires_at")
+    if (
+        not isinstance(issued_at, int)
+        or not isinstance(expires_at, int)
+        or expires_at <= issued_at
+        or expires_at - issued_at > 7 * 24 * 60 * 60
+    ):
+        raise ValidationError("invalid assignment validity")
+    now = int(time.time()) if now is None else int(now)
+    if validate_time and (issued_at > now + 300 or expires_at < now):
+        raise ValidationError("assignment is not currently valid")
+    target_tags = ProfileStore._validate_target_tags(
+        document.get("target_tags", [])
+    )
+    return {
+        "assignment_id": assignment_id,
+        "enrollment_id": enrollment_id,
+        "enrollment_generation": document["enrollment_generation"],
+        "channel": document["channel"],
+        "channel_generation": document["channel_generation"],
+        "revision_id": document["revision_id"],
+        "assignment_kind": kind,
+        "apply_policy": document["apply_policy"],
+        "target_tags": target_tags,
     }
 
 
@@ -89,6 +218,7 @@ class ProfileStore:
             raise ValueError("a signed-document verifier is required")
         self.path = Path(path)
         self.path.parent.mkdir(parents=True, exist_ok=True)
+        self.blob_root = self.path.parent / "blobs" / "sha256"
         self.verify_signed_document = verify_signed_document
         self.bootstrap_keys = bootstrap_keys or {}
         self._migrate()
@@ -132,6 +262,31 @@ class ProfileStore:
                     result TEXT NOT NULL,
                     document TEXT NOT NULL,
                     PRIMARY KEY(enrollment_id, channel, revision_id)
+                );
+                CREATE TABLE IF NOT EXISTS assignment_reports (
+                    assignment_id TEXT NOT NULL,
+                    enrollment_id TEXT NOT NULL,
+                    enrollment_generation INTEGER NOT NULL,
+                    channel TEXT NOT NULL,
+                    channel_generation INTEGER NOT NULL,
+                    revision_id TEXT NOT NULL,
+                    assignment_kind TEXT NOT NULL,
+                    result TEXT NOT NULL,
+                    document TEXT NOT NULL,
+                    PRIMARY KEY(enrollment_id, assignment_id)
+                );
+                CREATE TABLE IF NOT EXISTS admin_requests (
+                    actor_key_id TEXT NOT NULL,
+                    nonce TEXT NOT NULL,
+                    request_sha256 TEXT NOT NULL,
+                    expires_at INTEGER NOT NULL,
+                    PRIMARY KEY(actor_key_id, nonce)
+                );
+                CREATE TABLE IF NOT EXISTS blobs (
+                    digest TEXT PRIMARY KEY,
+                    size INTEGER NOT NULL,
+                    media_type TEXT NOT NULL,
+                    created_at INTEGER NOT NULL
                 );
                 CREATE TABLE IF NOT EXISTS idempotency (
                     idempotency_key TEXT PRIMARY KEY,
@@ -210,7 +365,7 @@ class ProfileStore:
             raise ValidationError(
                 "backup is not a valid SQLite database"
             ) from error
-        if integrity != "ok" or version != DATABASE_SCHEMA_VERSION:
+        if integrity != "ok" or version not in {2, DATABASE_SCHEMA_VERSION}:
             raise ValidationError(
                 "backup is not a valid SQLite database"
             )
@@ -264,12 +419,156 @@ class ProfileStore:
             self.path, destination, "backup already exists"
         )
 
+    def backup_epoch(self, destination):
+        destination = Path(destination)
+        if destination.exists():
+            raise Conflict("backup epoch already exists")
+        destination.parent.mkdir(parents=True, exist_ok=True)
+        temporary = Path(
+            tempfile.mkdtemp(
+                prefix=".%s." % destination.name,
+                dir=str(destination.parent),
+            )
+        )
+        try:
+            database_result = self._publish_database(
+                self.path,
+                temporary / "state.sqlite",
+                "backup database already exists",
+            )
+            inventory = []
+            with sqlite3.connect(temporary / "state.sqlite") as database:
+                database.row_factory = sqlite3.Row
+                rows = database.execute(
+                    "SELECT digest, size, media_type FROM blobs ORDER BY digest"
+                ).fetchall()
+            for row in rows:
+                source = self._blob_path(row["digest"])
+                payload = source.read_bytes()
+                if (
+                    len(payload) != row["size"]
+                    or "sha256:" + hashlib.sha256(payload).hexdigest()
+                    != row["digest"]
+                    or not valid_blob_media(payload, row["media_type"])
+                ):
+                    raise Conflict("backup epoch contains an invalid blob")
+                target = (
+                    temporary
+                    / "blobs"
+                    / row["digest"].split(":", 1)[1][:2]
+                    / row["digest"].split(":", 1)[1]
+                )
+                target.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
+                target.write_bytes(payload)
+                os.chmod(target, 0o600)
+                inventory.append(
+                    {
+                        "sha256": row["digest"],
+                        "size": row["size"],
+                        "media_type": row["media_type"],
+                    }
+                )
+            epoch = {
+                "schema": 1,
+                "database": {
+                    "file": "state.sqlite",
+                    "bytes": database_result["bytes"],
+                    "sha256": database_result["sha256"],
+                },
+                "blobs": inventory,
+            }
+            manifest = temporary / "inventory.json"
+            manifest.write_bytes(canonical_json(epoch) + b"\n")
+            os.chmod(manifest, 0o600)
+            os.replace(temporary, destination)
+        except Exception:
+            shutil.rmtree(temporary, ignore_errors=True)
+            raise
+        return {
+            "path": str(destination),
+            "database_sha256": database_result["sha256"],
+            "blob_count": len(inventory),
+        }
+
     @classmethod
     def restore_backup(cls, source, destination):
         source = cls._validated_database(source)
         return cls._publish_database(
             source, destination, "restore target already exists"
         )
+
+    @classmethod
+    def restore_epoch(cls, source, destination):
+        source = Path(source)
+        destination = Path(destination)
+        if destination.exists() or (destination.parent / "blobs").exists():
+            raise Conflict("restore target already exists")
+        try:
+            epoch = json.loads(
+                (source / "inventory.json").read_text(encoding="utf-8")
+            )
+        except (OSError, json.JSONDecodeError) as error:
+            raise ValidationError("invalid backup epoch inventory") from error
+        if (
+            not isinstance(epoch, dict)
+            or epoch.get("schema") != 1
+            or not isinstance(epoch.get("database"), dict)
+            or not isinstance(epoch.get("blobs"), list)
+        ):
+            raise ValidationError("invalid backup epoch inventory")
+        database_source = source / "state.sqlite"
+        database_payload = database_source.read_bytes()
+        database_meta = epoch["database"]
+        if (
+            database_meta.get("file") != "state.sqlite"
+            or database_meta.get("bytes") != len(database_payload)
+            or database_meta.get("sha256")
+            != hashlib.sha256(database_payload).hexdigest()
+        ):
+            raise ValidationError("backup epoch database digest mismatch")
+        cls._validated_database(database_source)
+        staged_blobs = []
+        for blob in epoch["blobs"]:
+            if not isinstance(blob, dict) or set(blob) != {
+                "sha256",
+                "size",
+                "media_type",
+            }:
+                raise ValidationError("invalid backup epoch blob inventory")
+            digest = blob["sha256"]
+            if not isinstance(digest, str) or not REVISION.fullmatch(digest):
+                raise ValidationError("invalid backup epoch blob digest")
+            value = digest.split(":", 1)[1]
+            blob_source = source / "blobs" / value[:2] / value
+            try:
+                payload = blob_source.read_bytes()
+            except OSError as error:
+                raise ValidationError(
+                    "backup epoch blob is missing"
+                ) from error
+            if (
+                blob.get("size") != len(payload)
+                or "sha256:" + hashlib.sha256(payload).hexdigest() != digest
+                or not valid_blob_media(payload, blob.get("media_type"))
+            ):
+                raise ValidationError("backup epoch blob digest mismatch")
+            staged_blobs.append((digest, payload))
+        result = cls._publish_database(
+            database_source, destination, "restore target already exists"
+        )
+        blob_root = destination.parent / "blobs" / "sha256"
+        try:
+            for digest, payload in staged_blobs:
+                value = digest.split(":", 1)[1]
+                target = blob_root / value[:2] / value
+                target.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
+                target.write_bytes(payload)
+                os.chmod(target, 0o600)
+        except Exception:
+            destination.unlink(missing_ok=True)
+            shutil.rmtree(destination.parent / "blobs", ignore_errors=True)
+            raise
+        return {**result, "blob_count": len(staged_blobs)}
 
     @staticmethod
     def _token_digest(token):
@@ -529,6 +828,67 @@ class ProfileStore:
                 raise NotFound("enrollment does not exist")
         return {"enrollment_id": enrollment_id, "revoked": True}
 
+    def authorize_admin_request(
+        self, document, operation, idempotency_key, now=None
+    ):
+        if not isinstance(document, dict) or document.get("schema") != 1:
+            raise Unauthorized("admin authentication failed")
+        role = document.get("actor_role")
+        if (
+            role not in ADMIN_ROLE_OPERATIONS
+            or operation not in ADMIN_ROLE_OPERATIONS[role]
+            or document.get("operation") != operation
+            or document.get("idempotency_key") != idempotency_key
+            or not isinstance(document.get("payload"), dict)
+        ):
+            raise Unauthorized("admin authorization failed")
+        nonce = document.get("nonce")
+        if not isinstance(nonce, str) or not NONCE.fullmatch(nonce):
+            raise Unauthorized("admin authentication failed")
+        issued_at = document.get("issued_at")
+        expires_at = document.get("expires_at")
+        now = int(time.time()) if now is None else int(now)
+        if (
+            not isinstance(issued_at, int)
+            or not isinstance(expires_at, int)
+            or expires_at <= issued_at
+            or expires_at - issued_at > 300
+            or issued_at > now + 30
+            or expires_at < now
+        ):
+            raise Unauthorized("admin request is not currently valid")
+        kind = "admin" if role == "admin" else "admin_" + role
+        if not self.verify_signed_document(kind, document):
+            raise Unauthorized("admin signature is invalid")
+        signature = document.get("signature", {})
+        actor_key_id = signature.get("key_id")
+        if not isinstance(actor_key_id, str) or not KEY_ID.fullmatch(
+            actor_key_id
+        ):
+            raise Unauthorized("admin authentication failed")
+        request_sha256 = hashlib.sha256(canonical_json(document)).hexdigest()
+        with self.connect() as database:
+            database.execute("BEGIN IMMEDIATE")
+            database.execute(
+                "DELETE FROM admin_requests WHERE expires_at < ?", (now,)
+            )
+            existing = database.execute(
+                """
+                SELECT request_sha256 FROM admin_requests
+                WHERE actor_key_id=? AND nonce=?
+                """,
+                (actor_key_id, nonce),
+            ).fetchone()
+            if existing is not None:
+                if existing["request_sha256"] != request_sha256:
+                    raise Conflict("admin nonce replayed with different request")
+            else:
+                database.execute(
+                    "INSERT INTO admin_requests VALUES (?, ?, ?, ?)",
+                    (actor_key_id, nonce, request_sha256, expires_at),
+                )
+        return document["payload"]
+
     def _idempotent(self, database, key, operation, action):
         if not isinstance(key, str) or len(key) < 8:
             raise ValidationError("invalid idempotency key")
@@ -564,6 +924,147 @@ class ProfileStore:
                 (revision_id, payload),
             )
         return {"revision_id": revision_id}
+
+    def _blob_path(self, digest):
+        if not isinstance(digest, str) or not REVISION.fullmatch(digest):
+            raise ValidationError("invalid blob digest")
+        value = digest.split(":", 1)[1]
+        return self.blob_root / value[:2] / value
+
+    def put_blob(self, digest, payload, media_type):
+        if not isinstance(payload, bytes) or len(payload) > MAX_BLOB_BYTES:
+            raise ValidationError("invalid blob size")
+        if media_type not in BLOB_MEDIA_TYPES or not valid_blob_media(
+            payload, media_type
+        ):
+            raise ValidationError("invalid blob media type")
+        expected = "sha256:" + hashlib.sha256(payload).hexdigest()
+        if digest != expected:
+            raise ValidationError("blob digest mismatch")
+        destination = self._blob_path(digest)
+        with self.connect() as database:
+            database.execute("BEGIN IMMEDIATE")
+            row = database.execute(
+                "SELECT size, media_type FROM blobs WHERE digest=?", (digest,)
+            ).fetchone()
+            if row is not None:
+                if (
+                    row["size"] != len(payload)
+                    or row["media_type"] != media_type
+                    or not destination.is_file()
+                    or destination.read_bytes() != payload
+                ):
+                    raise Conflict("immutable blob already differs")
+                return {
+                    "sha256": digest,
+                    "size": len(payload),
+                    "media_type": media_type,
+                    "stored": False,
+                }
+            total = database.execute(
+                "SELECT COALESCE(SUM(size), 0) FROM blobs"
+            ).fetchone()[0]
+            if total + len(payload) > MAX_BLOB_STORE_BYTES:
+                raise Conflict("blob store quota exceeded")
+            self.blob_root.mkdir(parents=True, exist_ok=True, mode=0o700)
+            destination.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
+            if shutil.disk_usage(self.blob_root).free - len(payload) < (
+                MIN_BLOB_DISK_RESERVE
+            ):
+                raise Conflict("blob store disk reserve reached")
+            descriptor, temporary_name = tempfile.mkstemp(
+                prefix=".blob.", dir=str(destination.parent)
+            )
+            temporary = Path(temporary_name)
+            try:
+                with os.fdopen(descriptor, "wb") as handle:
+                    handle.write(payload)
+                    handle.flush()
+                    os.fsync(handle.fileno())
+                os.chmod(temporary, 0o600)
+                try:
+                    os.link(temporary, destination)
+                except FileExistsError as error:
+                    raise Conflict("blob file already exists") from error
+            finally:
+                temporary.unlink(missing_ok=True)
+            database.execute(
+                "INSERT INTO blobs VALUES (?, ?, ?, ?)",
+                (digest, len(payload), media_type, int(time.time())),
+            )
+        return {
+            "sha256": digest,
+            "size": len(payload),
+            "media_type": media_type,
+            "stored": True,
+        }
+
+    @staticmethod
+    def _manifest_references_blob(value, digest, size, media_type):
+        if isinstance(value, dict):
+            if value.get("sha256") == digest:
+                return (
+                    value.get("size") == size
+                    and value.get("media_type") == media_type
+                )
+            return any(
+                ProfileStore._manifest_references_blob(
+                    item, digest, size, media_type
+                )
+                for item in value.values()
+            )
+        if isinstance(value, list):
+            return any(
+                ProfileStore._manifest_references_blob(
+                    item, digest, size, media_type
+                )
+                for item in value
+            )
+        return False
+
+    def blob(self, digest, enrollment_id, access_token):
+        path = self._blob_path(digest)
+        with self.connect() as database:
+            enrollment = self._authenticate(
+                database, enrollment_id, access_token
+            )
+            assignment = database.execute(
+                """
+                SELECT revision_id FROM assignments
+                WHERE enrollment_id=? AND channel=?
+                """,
+                (enrollment_id, enrollment["channel"]),
+            ).fetchone()
+            if assignment is None:
+                raise Unauthorized("blob is not reachable from assignment")
+            row = database.execute(
+                "SELECT size, media_type FROM blobs WHERE digest=?", (digest,)
+            ).fetchone()
+            revision = database.execute(
+                "SELECT manifest FROM revisions WHERE revision_id=?",
+                (assignment["revision_id"],),
+            ).fetchone()
+            if (
+                row is None
+                or revision is None
+                or not self._manifest_references_blob(
+                    json.loads(revision["manifest"]),
+                    digest,
+                    row["size"],
+                    row["media_type"],
+                )
+            ):
+                raise Unauthorized("blob is not reachable from assignment")
+        try:
+            payload = path.read_bytes()
+        except OSError as error:
+            raise NotFound("blob does not exist") from error
+        if (
+            len(payload) != row["size"]
+            or "sha256:" + hashlib.sha256(payload).hexdigest() != digest
+        ):
+            raise Conflict("blob integrity check failed")
+        return payload, row["media_type"]
 
     def revision(self, revision_id, enrollment_id, access_token):
         if not isinstance(revision_id, str) or not REVISION.fullmatch(
@@ -630,6 +1131,11 @@ class ProfileStore:
     def assign_candidate(self, document, idempotency_key):
         if not self.verify_signed_document("assignment", document):
             raise ValidationError("invalid assignment signature")
+        contract = (
+            validate_assignment_v2(document, expected_kind="candidate")
+            if document.get("schema") == 2
+            else None
+        )
         enrollment = document.get("enrollment_id")
         channel = document.get("channel")
         revision_id = document.get("revision_id")
@@ -641,14 +1147,14 @@ class ProfileStore:
 
             def action():
                 row = database.execute(
-                    "SELECT candidate_revision FROM channels WHERE channel=?",
+                    "SELECT candidate_revision, generation FROM channels WHERE channel=?",
                     (channel,),
                 ).fetchone()
                 if not row or row["candidate_revision"] != revision_id:
                     raise Conflict("assignment does not target current candidate")
                 enrolled = database.execute(
                     """
-                    SELECT channel, target_tags, revoked
+                    SELECT channel, generation, target_tags, revoked
                     FROM enrollments WHERE enrollment_id=?
                     """,
                     (enrollment,),
@@ -661,6 +1167,14 @@ class ProfileStore:
                     )
                     if enrolled_tags != target_tags:
                         raise Conflict("assignment target tags differ from enrollment")
+                    if contract is not None and (
+                        contract["enrollment_generation"]
+                        != enrolled["generation"]
+                        or contract["channel_generation"] != row["generation"]
+                    ):
+                        raise Conflict("assignment generation differs")
+                elif contract is not None:
+                    raise Conflict("assignment enrollment is not eligible")
                 database.execute(
                     """
                     INSERT OR REPLACE INTO assignments
@@ -679,6 +1193,17 @@ class ProfileStore:
                     "revision_id": revision_id,
                     "assignment_kind": "candidate",
                     "target_tags": target_tags,
+                    **(
+                        {
+                            "assignment_id": contract["assignment_id"],
+                            "channel_generation": contract[
+                                "channel_generation"
+                            ],
+                            "apply_policy": contract["apply_policy"],
+                        }
+                        if contract is not None
+                        else {}
+                    ),
                 }
 
             return self._idempotent(
@@ -688,16 +1213,19 @@ class ProfileStore:
     def bootstrap_active(self, channel, document, idempotency_key):
         """Create a signed client-compatible assignment for active state.
 
-        The server never signs assignments.  This operation only accepts an
-        offline-promoter-signed document and constrains it to the exact active
-        revision and an existing eligible enrollment.  The stored assignment
-        remains ``candidate`` for compatibility with released read-only
-        clients, which already require and verify that signed assignment kind.
+        The server never signs assignments.  A schema-2 document is stored as
+        an active assignment.  A legacy document remains a candidate for
+        compatibility with released 0.1.8 read-only clients.
         """
         if not CHANNEL.fullmatch(str(channel)):
             raise ValidationError("invalid channel")
         if not self.verify_signed_document("assignment", document):
             raise ValidationError("invalid assignment signature")
+        contract = (
+            validate_assignment_v2(document, expected_kind="active")
+            if document.get("schema") == 2
+            else None
+        )
         enrollment = document.get("enrollment_id")
         document_channel = document.get("channel")
         revision_id = document.get("revision_id")
@@ -711,7 +1239,7 @@ class ProfileStore:
 
             def action():
                 current = database.execute(
-                    "SELECT active_revision FROM channels WHERE channel=?",
+                    "SELECT active_revision, generation FROM channels WHERE channel=?",
                     (channel,),
                 ).fetchone()
                 if not current or current["active_revision"] != revision_id:
@@ -720,7 +1248,7 @@ class ProfileStore:
                     )
                 enrolled = database.execute(
                     """
-                    SELECT channel, target_tags, revoked
+                    SELECT channel, generation, target_tags, revoked
                     FROM enrollments WHERE enrollment_id=?
                     """,
                     (enrollment,),
@@ -738,15 +1266,23 @@ class ProfileStore:
                     raise Conflict(
                         "bootstrap target tags differ from enrollment"
                     )
+                if contract is not None and (
+                    contract["enrollment_generation"]
+                    != enrolled["generation"]
+                    or contract["channel_generation"] != current["generation"]
+                ):
+                    raise Conflict("bootstrap assignment generation differs")
+                stored_kind = "active" if contract is not None else "candidate"
                 database.execute(
                     """
                     INSERT OR REPLACE INTO assignments
-                    VALUES (?, ?, ?, 'candidate', ?)
+                    VALUES (?, ?, ?, ?, ?)
                     """,
                     (
                         enrollment,
                         channel,
                         revision_id,
+                        stored_kind,
                         canonical_json(document).decode("utf-8"),
                     ),
                 )
@@ -754,9 +1290,20 @@ class ProfileStore:
                     "enrollment_id": enrollment,
                     "channel": channel,
                     "revision_id": revision_id,
-                    "assignment_kind": "candidate",
+                    "assignment_kind": stored_kind,
                     "assignment_source": "active-bootstrap",
                     "target_tags": target_tags,
+                    **(
+                        {
+                            "assignment_id": contract["assignment_id"],
+                            "channel_generation": contract[
+                                "channel_generation"
+                            ],
+                            "apply_policy": contract["apply_policy"],
+                        }
+                        if contract is not None
+                        else {}
+                    ),
                 }
 
             return self._idempotent(
@@ -790,19 +1337,72 @@ class ProfileStore:
                 )
             if not verified:
                 raise ValidationError("invalid report signature")
-            if result not in {"success", "failure"}:
+            if result not in REPORT_RESULTS:
                 raise ValidationError("invalid report result")
 
             def action():
                 assignment = database.execute(
                     """
-                    SELECT revision_id FROM assignments
+                    SELECT revision_id, assignment_kind, document FROM assignments
                     WHERE enrollment_id=? AND channel=?
                     """,
                     (enrollment, channel),
                 ).fetchone()
                 if not assignment or assignment["revision_id"] != revision_id:
                     raise Conflict("report does not match assignment")
+                assignment_document = json.loads(assignment["document"])
+                if assignment_document.get("schema") == 2:
+                    contract = validate_assignment_v2(
+                        assignment_document,
+                        expected_kind=assignment["assignment_kind"],
+                        validate_time=False,
+                    )
+                    expected = {
+                        "assignment_id": contract["assignment_id"],
+                        "assignment_kind": contract["assignment_kind"],
+                        "enrollment_generation": contract[
+                            "enrollment_generation"
+                        ],
+                        "channel_generation": contract[
+                            "channel_generation"
+                        ],
+                    }
+                    if any(
+                        document.get(key) != value
+                        for key, value in expected.items()
+                    ):
+                        raise Conflict("report does not match assignment")
+                    database.execute(
+                        """
+                        INSERT OR REPLACE INTO assignment_reports (
+                            assignment_id, enrollment_id,
+                            enrollment_generation, channel,
+                            channel_generation, revision_id,
+                            assignment_kind, result, document
+                        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+                        """,
+                        (
+                            contract["assignment_id"],
+                            enrollment,
+                            contract["enrollment_generation"],
+                            channel,
+                            contract["channel_generation"],
+                            revision_id,
+                            contract["assignment_kind"],
+                            result,
+                            canonical_json(document).decode("utf-8"),
+                        ),
+                    )
+                    return {
+                        "assignment_id": contract["assignment_id"],
+                        "assignment_kind": contract["assignment_kind"],
+                        "channel_generation": contract[
+                            "channel_generation"
+                        ],
+                        "enrollment_id": enrollment,
+                        "revision_id": revision_id,
+                        "result": result,
+                    }
                 database.execute(
                     "INSERT OR REPLACE INTO reports VALUES (?, ?, ?, ?, ?)",
                     (
@@ -831,9 +1431,29 @@ class ProfileStore:
         required_enrollments,
         event,
         idempotency_key,
+        active_assignments=None,
     ):
         if not self.verify_signed_document("promotion", event):
             raise ValidationError("invalid promotion signature")
+        active_contracts = None
+        if active_assignments is not None:
+            if not isinstance(active_assignments, list) or not active_assignments:
+                raise ValidationError("active assignment batch is empty")
+            active_contracts = []
+            seen = set()
+            for document in active_assignments:
+                if not self.verify_signed_document("assignment", document):
+                    raise ValidationError("invalid active assignment signature")
+                contract = validate_assignment_v2(
+                    document, expected_kind="active"
+                )
+                if contract["assignment_id"] in seen:
+                    raise ValidationError("duplicate active assignment")
+                seen.add(contract["assignment_id"])
+                active_contracts.append((contract, document))
+            declared = event.get("active_assignment_ids")
+            if declared != sorted(seen):
+                raise Conflict("promotion does not bind active assignments")
         with self.connect() as database:
             database.execute("BEGIN IMMEDIATE")
 
@@ -850,16 +1470,57 @@ class ProfileStore:
                 for enrollment in required_enrollments:
                     report = database.execute(
                         """
-                        SELECT result FROM reports
+                        SELECT result FROM assignment_reports
                         WHERE enrollment_id=? AND channel=? AND revision_id=?
+                          AND assignment_kind='candidate'
+                        ORDER BY channel_generation DESC LIMIT 1
                         """,
                         (enrollment, channel, candidate_revision),
                     ).fetchone()
+                    if report is None:
+                        report = database.execute(
+                            """
+                            SELECT result FROM reports
+                            WHERE enrollment_id=? AND channel=? AND revision_id=?
+                            """,
+                            (enrollment, channel, candidate_revision),
+                        ).fetchone()
                     if not report or report["result"] != "success":
                         raise Conflict("required canary report is missing")
                 generation = current["generation"] + 1
                 if event.get("generation") != generation:
                     raise Conflict("promotion generation differs")
+                if active_contracts is not None:
+                    for contract, _document in active_contracts:
+                        if (
+                            contract["channel"] != channel
+                            or contract["revision_id"] != candidate_revision
+                            or contract["channel_generation"] != generation
+                        ):
+                            raise Conflict(
+                                "active assignment differs from promotion"
+                            )
+                        enrolled = database.execute(
+                            """
+                            SELECT generation, channel, target_tags, revoked
+                            FROM enrollments WHERE enrollment_id=?
+                            """,
+                            (contract["enrollment_id"],),
+                        ).fetchone()
+                        if (
+                            enrolled is None
+                            or enrolled["revoked"]
+                            or enrolled["channel"] != channel
+                            or enrolled["generation"]
+                            != contract["enrollment_generation"]
+                            or self._validate_target_tags(
+                                json.loads(enrolled["target_tags"])
+                            )
+                            != contract["target_tags"]
+                        ):
+                            raise Conflict(
+                                "active assignment enrollment is not eligible"
+                            )
                 database.execute(
                     """
                     UPDATE channels
@@ -871,10 +1532,36 @@ class ProfileStore:
                 database.execute(
                     "DELETE FROM assignments WHERE channel=?", (channel,)
                 )
+                if active_contracts is not None:
+                    for contract, document in active_contracts:
+                        database.execute(
+                            """
+                            INSERT INTO assignments (
+                                enrollment_id, channel, revision_id,
+                                assignment_kind, document
+                            ) VALUES (?, ?, ?, 'active', ?)
+                            """,
+                            (
+                                contract["enrollment_id"],
+                                channel,
+                                candidate_revision,
+                                canonical_json(document).decode("utf-8"),
+                            ),
+                        )
                 return {
                     "channel": channel,
                     "active_revision": candidate_revision,
                     "generation": generation,
+                    **(
+                        {
+                            "active_assignment_ids": sorted(
+                                contract["assignment_id"]
+                                for contract, _document in active_contracts
+                            )
+                        }
+                        if active_contracts is not None
+                        else {}
+                    ),
                 }
 
             return self._idempotent(

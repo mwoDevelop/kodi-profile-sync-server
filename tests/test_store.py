@@ -1,6 +1,8 @@
 import hashlib
 import os
+import shutil
 import sqlite3
+import time
 
 import pytest
 
@@ -108,7 +110,40 @@ def test_restore_requires_valid_offline_backup_and_explicit_empty_target(tmp_pat
     result = ProfileStore.restore_backup(backup, target_path)
     assert result["sha256"] == hashlib.sha256(target_path.read_bytes()).hexdigest()
     restored = ProfileStore(target_path, lambda _kind, _document: True)
-    assert restored.readiness()["database_schema"] == 2
+    assert restored.readiness()["database_schema"] == 3
+
+
+def assignment_v2(
+    enrollment,
+    enrollment_generation,
+    revision_id,
+    assignment_kind,
+    channel_generation,
+    target_tags=(),
+    apply_policy="enforce",
+    nonce="assignment-nonce-0001",
+):
+    now = int(time.time())
+    identity = {
+        "schema": 2,
+        "enrollment_id": enrollment,
+        "enrollment_generation": enrollment_generation,
+        "channel": CHANNEL,
+        "channel_generation": channel_generation,
+        "revision_id": revision_id,
+        "target_tags": sorted(target_tags),
+        "assignment_kind": assignment_kind,
+        "apply_policy": apply_policy,
+        "nonce": nonce,
+        "issued_at": now,
+        "expires_at": now + 3600,
+    }
+    return {
+        **identity,
+        "assignment_id": "sha256:"
+        + hashlib.sha256(canonical_json(identity)).hexdigest(),
+        "signature": "test-signature",
+    }
 
     with pytest.raises(Conflict, match="restore target already exists"):
         ProfileStore.restore_backup(backup, target_path)
@@ -164,6 +199,52 @@ def test_candidate_cas_and_idempotency(tmp_path):
             None,
             None,
             "publish-0002",
+        )
+
+
+def test_admin_request_binds_role_operation_and_rejects_nonce_replay(tmp_path):
+    state = store(tmp_path)
+    document = {
+        "schema": 1,
+        "actor_role": "publish",
+        "operation": "publish_candidate",
+        "idempotency_key": "admin-publish-0001",
+        "nonce": "admin-request-nonce-0001",
+        "issued_at": 1000,
+        "expires_at": 1120,
+        "payload": {"revision_id": "sha256:" + "a" * 64},
+        "signature": {
+            "algorithm": "Ed25519",
+            "key_id": "publisher-admin",
+            "value": "test",
+        },
+    }
+
+    assert state.authorize_admin_request(
+        document,
+        "publish_candidate",
+        "admin-publish-0001",
+        now=1050,
+    ) == document["payload"]
+    assert state.authorize_admin_request(
+        document,
+        "publish_candidate",
+        "admin-publish-0001",
+        now=1050,
+    ) == document["payload"]
+
+    replay = dict(document)
+    replay["payload"] = {"revision_id": "sha256:" + "b" * 64}
+    with pytest.raises(Conflict, match="nonce replayed"):
+        state.authorize_admin_request(
+            replay,
+            "publish_candidate",
+            "admin-publish-0001",
+            now=1050,
+        )
+    with pytest.raises(Unauthorized, match="authorization"):
+        state.authorize_admin_request(
+            document, "promote", "admin-publish-0001", now=1050
         )
 
 
@@ -511,6 +592,204 @@ def test_signed_active_bootstrap_is_exact_idempotent_and_reportable(tmp_path):
         device_seed,
     )
     assert state.record_report(report, "report-bootstrap")["result"] == "success"
+
+
+def test_assignment_v2_promotes_signed_active_batch_and_keeps_both_reports(
+    tmp_path,
+):
+    device_seed = b"v" * 32
+    state = ProfileStore(
+        tmp_path / "state.sqlite",
+        verify_signed_document=lambda _kind, _document: True,
+    )
+    manifest = revision("active-v2")
+    state.put_revision(manifest)
+    state.publish_candidate(
+        CHANNEL, manifest["revision_id"], None, None, "publish-v2"
+    )
+    state.create_pairing_code(
+        "active-v2-device",
+        CHANNEL,
+        code="56789012",
+        ttl_seconds=60,
+        target_tags=["home"],
+    )
+    enrolled = state.pair(
+        "56789012",
+        "active-v2-device",
+        CHANNEL,
+        "active-v2-key",
+        public_key_record(device_seed, ["report"])["public_key"],
+    )
+    candidate = assignment_v2(
+        enrolled["enrollment_id"],
+        1,
+        manifest["revision_id"],
+        "candidate",
+        0,
+        ["home"],
+        nonce="candidate-nonce-0001",
+    )
+    state.assign_candidate(candidate, "assign-v2-candidate")
+    candidate_report_identity = {
+        "assignment_id": candidate["assignment_id"],
+        "assignment_kind": "candidate",
+        "channel_generation": 0,
+        "enrollment_generation": 1,
+        "enrollment_id": enrolled["enrollment_id"],
+        "channel": CHANNEL,
+        "revision_id": manifest["revision_id"],
+        "result": "success",
+    }
+    candidate_report = sign_document(
+        "report",
+        candidate_report_identity,
+        "active-v2-key",
+        device_seed,
+    )
+    state.record_report(candidate_report, "report-v2-candidate")
+
+    active = assignment_v2(
+        enrolled["enrollment_id"],
+        1,
+        manifest["revision_id"],
+        "active",
+        1,
+        ["home"],
+        nonce="active-batch-nonce-0001",
+    )
+    event = signed(
+        "promotion",
+        generation=1,
+        active_assignment_ids=[active["assignment_id"]],
+    )
+    promoted = state.promote(
+        CHANNEL,
+        manifest["revision_id"],
+        None,
+        [enrolled["enrollment_id"]],
+        event,
+        "promote-v2",
+        active_assignments=[active],
+    )
+
+    assert promoted["active_assignment_ids"] == [active["assignment_id"]]
+    assert state.assignment(
+        enrolled["enrollment_id"], CHANNEL, enrolled["access_token"]
+    ) == {"assignment_kind": "active", "document": active}
+
+    active_report = sign_document(
+        "report",
+        {
+            "assignment_id": active["assignment_id"],
+            "assignment_kind": "active",
+            "channel_generation": 1,
+            "enrollment_generation": 1,
+            "enrollment_id": enrolled["enrollment_id"],
+            "channel": CHANNEL,
+            "revision_id": manifest["revision_id"],
+            "result": "success",
+        },
+        "active-v2-key",
+        device_seed,
+    )
+    state.record_report(active_report, "report-v2-active")
+    with state.connect() as database:
+        assert database.execute(
+            "SELECT COUNT(*) FROM assignment_reports"
+        ).fetchone()[0] == 2
+
+
+def test_blob_is_content_addressed_and_reachable_only_from_assignment(tmp_path):
+    payload = b"\x89PNG\r\n\x1a\nserver-blob"
+    digest = "sha256:" + hashlib.sha256(payload).hexdigest()
+    identity = {
+        "schema": 2,
+        "policy_sha256": "d" * 64,
+        "kodi_major": 21,
+        "adapters": {
+            "kodi.favourites": {
+                "adapter": "kodi_favourites_v1",
+                "artwork": [
+                    {
+                        "sha256": digest,
+                        "size": len(payload),
+                        "media_type": "image/png",
+                    }
+                ],
+            }
+        },
+    }
+    manifest = {
+        **identity,
+        "revision_id": "sha256:"
+        + hashlib.sha256(canonical_json(identity)).hexdigest(),
+        "signature": "test-signature",
+    }
+    state = store(tmp_path)
+    state.put_revision(manifest)
+    state.put_blob(digest, payload, "image/png")
+    assert state.put_blob(digest, payload, "image/png")["stored"] is False
+    state.publish_candidate(
+        CHANNEL, manifest["revision_id"], None, None, "publish-blob"
+    )
+    state.create_pairing_code(
+        "blob-device",
+        CHANNEL,
+        code="67890123",
+        ttl_seconds=60,
+        target_tags=["home"],
+    )
+    enrolled = state.pair(
+        "67890123",
+        "blob-device",
+        CHANNEL,
+        "blob-device-key",
+        "dQW21pY0MyWT7V8Qt1OH1J__hnMZs5VZFcjFNjkt5oU",
+    )
+    assignment = assignment_v2(
+        enrolled["enrollment_id"],
+        1,
+        manifest["revision_id"],
+        "candidate",
+        0,
+        ["home"],
+        nonce="blob-assignment-nonce-0001",
+    )
+    state.assign_candidate(assignment, "assign-blob")
+
+    assert state.blob(
+        digest, enrolled["enrollment_id"], enrolled["access_token"]
+    ) == (payload, "image/png")
+    other_payload = b"\x89PNG\r\n\x1a\nother"
+    unrelated = "sha256:" + hashlib.sha256(other_payload).hexdigest()
+    state.put_blob(unrelated, other_payload, "image/png")
+    with pytest.raises(Unauthorized, match="not reachable"):
+        state.blob(
+            unrelated,
+            enrolled["enrollment_id"],
+            enrolled["access_token"],
+        )
+
+    epoch = tmp_path / "epoch"
+    assert state.backup_epoch(epoch)["blob_count"] == 2
+    restored_path = tmp_path / "restored-epoch" / "state.sqlite"
+    assert ProfileStore.restore_epoch(epoch, restored_path)["blob_count"] == 2
+    restored = ProfileStore(
+        restored_path, verify_signed_document=lambda _kind, _document: True
+    )
+    assert restored.blob(
+        digest, enrolled["enrollment_id"], enrolled["access_token"]
+    ) == (payload, "image/png")
+
+    damaged = tmp_path / "damaged-epoch"
+    shutil.copytree(epoch, damaged)
+    value = digest.split(":", 1)[1]
+    (damaged / "blobs" / value[:2] / value).unlink()
+    with pytest.raises(ValidationError, match="blob is missing"):
+        ProfileStore.restore_epoch(
+            damaged, tmp_path / "bad-restore" / "state.sqlite"
+        )
 
 
 def test_active_bootstrap_rejects_wrong_scope_tags_and_revocation(tmp_path):
