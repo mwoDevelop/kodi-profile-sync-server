@@ -22,11 +22,19 @@ def main(argv=None):
     revoke.add_argument("enrollment_id")
     backup = commands.add_parser("backup")
     backup.add_argument("--output", required=True)
+    backup_epoch = commands.add_parser("backup-epoch")
+    backup_epoch.add_argument("--output", required=True)
     restore = commands.add_parser("restore")
     restore.add_argument("--input", required=True)
+    restore_epoch = commands.add_parser("restore-epoch")
+    restore_epoch.add_argument("--input", required=True)
     args = parser.parse_args(argv)
     if args.command == "restore":
         result = ProfileStore.restore_backup(args.input, args.database)
+        print(json.dumps(result, indent=2, sort_keys=True))
+        return 0
+    if args.command == "restore-epoch":
+        result = ProfileStore.restore_epoch(args.input, args.database)
         print(json.dumps(result, indent=2, sort_keys=True))
         return 0
     store = ProfileStore(
@@ -43,6 +51,8 @@ def main(argv=None):
         )
     elif args.command == "revoke":
         result = store.revoke_enrollment(args.enrollment_id)
+    elif args.command == "backup-epoch":
+        result = store.backup_epoch(args.output)
     else:
         result = store.backup(args.output)
     print(json.dumps(result, indent=2, sort_keys=True))

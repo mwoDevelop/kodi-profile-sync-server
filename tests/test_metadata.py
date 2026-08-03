@@ -9,7 +9,7 @@ def test_runtime_metadata_redacts_invalid_build(monkeypatch):
 
     assert metadata["service"] == "kodi-profile-sync-server"
     assert metadata["api_version"] == "v1"
-    assert metadata["database_schema"] == 2
+    assert metadata["database_schema"] == 3
     assert metadata["build"] == "invalid"
 
 
@@ -27,5 +27,5 @@ def test_store_readiness_reports_migrated_schema(tmp_path):
 
     assert store.readiness() == {
         "database": "ready",
-        "database_schema": 2,
+        "database_schema": 3,
     }

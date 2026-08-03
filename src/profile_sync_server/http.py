@@ -3,10 +3,13 @@
 from __future__ import annotations
 
 import argparse
+import base64
+import binascii
 import json
 import os
 import ssl
 import stat
+import threading
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from urllib.parse import parse_qs, urlparse
@@ -26,9 +29,16 @@ class Handler(BaseHTTPRequestHandler):
     store = None
     mode = "unconfigured"
     key_registry_path = None
+    surface = "unconfigured"
+    max_request_bytes = 1024 * 1024
 
     def _json(self):
-        length = int(self.headers.get("Content-Length", "0"))
+        try:
+            length = int(self.headers.get("Content-Length", "0"))
+        except ValueError as error:
+            raise ValidationError("invalid content length") from error
+        if length < 0 or length > self.max_request_bytes:
+            raise ValidationError("request body is too large")
         return json.loads(self.rfile.read(length) or b"{}")
 
     def _send(self, status, document):
@@ -36,6 +46,14 @@ class Handler(BaseHTTPRequestHandler):
         self.send_response(status)
         self.send_header("Content-Type", "application/json")
         self.send_header("Content-Length", str(len(payload)))
+        self.end_headers()
+        self.wfile.write(payload)
+
+    def _send_bytes(self, status, payload, media_type):
+        self.send_response(status)
+        self.send_header("Content-Type", media_type)
+        self.send_header("Content-Length", str(len(payload)))
+        self.send_header("X-Content-Type-Options", "nosniff")
         self.end_headers()
         self.wfile.write(payload)
 
@@ -97,6 +115,8 @@ class Handler(BaseHTTPRequestHandler):
             return
         parts = parsed.path.strip("/").split("/")
         if (
+            self.surface == "consumer"
+            and
             len(parts) == 4
             and parts[:2] == ["v1", "enrollments"]
             and parts[3] == "assignment"
@@ -110,6 +130,20 @@ class Handler(BaseHTTPRequestHandler):
             )
             return
         if (
+            self.surface == "consumer"
+            and len(parts) == 5
+            and parts[:2] == ["v1", "enrollments"]
+            and parts[3] == "blobs"
+        ):
+            self._dispatch_bytes(
+                lambda: self.store.blob(
+                    parts[4], parts[2], self._bearer()
+                )
+            )
+            return
+        if (
+            self.surface == "consumer"
+            and
             len(parts) == 5
             and parts[:2] == ["v1", "enrollments"]
             and parts[3] == "revisions"
@@ -124,9 +158,13 @@ class Handler(BaseHTTPRequestHandler):
 
     def do_POST(self):
         parts = urlparse(self.path).path.strip("/").split("/")
-        document = self._json()
+        try:
+            document = self._json()
+        except (ValidationError, json.JSONDecodeError) as error:
+            self._send(400, {"error": str(error) or "invalid_request"})
+            return
         key = self.headers.get("Idempotency-Key", "")
-        if parts == ["v1", "pair"]:
+        if self.surface == "consumer" and parts == ["v1", "pair"]:
             self._dispatch(
                 lambda: self.store.pair(
                     document["code"],
@@ -136,52 +174,115 @@ class Handler(BaseHTTPRequestHandler):
                     document["public_key"],
                 )
             )
-        elif parts == ["v1", "devices", "heartbeat"]:
+        elif self.surface == "consumer" and parts == ["v1", "devices", "heartbeat"]:
             self._dispatch(
                 lambda: self.store.heartbeat(document, self._bearer())
             )
-        elif parts == ["v1", "revisions"]:
-            self._dispatch(lambda: self.store.put_revision(document))
-        elif len(parts) == 4 and parts[:2] == ["v1", "channels"]:
+        elif self.surface == "admin" and parts == ["v1", "revisions"]:
+            self._dispatch(
+                lambda: self.store.put_revision(
+                    self.store.authorize_admin_request(
+                        document, "put_revision", key
+                    )
+                )
+            )
+        elif (
+            self.surface == "admin"
+            and len(parts) == 3
+            and parts[:2] == ["v1", "blobs"]
+        ):
+            self._dispatch(
+                lambda: self._put_blob(parts[2], document, key)
+            )
+        elif (
+            self.surface == "admin"
+            and len(parts) == 4
+            and parts[:2] == ["v1", "channels"]
+        ):
             channel = parts[2]
             action = parts[3]
             if action == "candidates":
                 self._dispatch(
-                    lambda: self.store.publish_candidate(
-                        channel,
-                        document["revision_id"],
-                        document.get("base_revision"),
-                        document.get("expected_candidate_head"),
-                        key,
+                    lambda: self._publish_candidate(
+                        channel, document, key
                     )
                 )
             elif action == "assignments":
                 self._dispatch(
-                    lambda: self.store.assign_candidate(document, key)
+                    lambda: self.store.assign_candidate(
+                        self.store.authorize_admin_request(
+                            document, "assign_candidate", key
+                        ),
+                        key,
+                    )
                 )
             elif action == "bootstrap-assignments":
                 self._dispatch(
                     lambda: self.store.bootstrap_active(
-                        channel, document, key
+                        channel,
+                        self.store.authorize_admin_request(
+                            document, "bootstrap_active", key
+                        ),
+                        key,
                     )
                 )
             elif action == "promote":
                 self._dispatch(
-                    lambda: self.store.promote(
-                        channel,
-                        document["candidate_revision"],
-                        document.get("expected_active_revision"),
-                        document["required_enrollments"],
-                        document["event"],
-                        key,
-                    )
+                    lambda: self._promote(channel, document, key)
                 )
             else:
                 self._send(404, {"error": "not_found"})
-        elif parts == ["v1", "reports"]:
+        elif self.surface == "consumer" and parts == ["v1", "reports"]:
             self._dispatch(lambda: self.store.record_report(document, key))
         else:
             self._send(404, {"error": "not_found"})
+
+    def _publish_candidate(self, channel, document, key):
+        payload = self.store.authorize_admin_request(
+            document, "publish_candidate", key
+        )
+        return self.store.publish_candidate(
+            channel,
+            payload["revision_id"],
+            payload.get("base_revision"),
+            payload.get("expected_candidate_head"),
+            key,
+        )
+
+    def _put_blob(self, digest, document, key):
+        payload = self.store.authorize_admin_request(
+            document, "put_blob", key
+        )
+        encoded = payload.get("content_base64")
+        if (
+            not isinstance(encoded, str)
+            or "=" in encoded
+            or len(encoded) > 12 * 1024 * 1024
+        ):
+            raise ValidationError("invalid blob encoding")
+        try:
+            content = base64.b64decode(
+                encoded + "=" * (-len(encoded) % 4),
+                altchars=b"-_",
+                validate=True,
+            )
+        except (ValueError, binascii.Error) as error:
+            raise ValidationError("invalid blob encoding") from error
+        return self.store.put_blob(digest, content, payload.get("media_type"))
+
+    def _promote(self, channel, document, key):
+        payload = self.store.authorize_admin_request(
+            document, "promote", key
+        )
+        return self.store.promote(
+            channel,
+            payload["candidate_revision"],
+            payload.get("expected_active_revision"),
+            payload["required_enrollments"],
+            payload["event"],
+            key,
+            active_assignments=payload.get("active_assignments"),
+        )
 
     def _dispatch(self, callback):
         try:
@@ -196,6 +297,19 @@ class Handler(BaseHTTPRequestHandler):
             self._send(401, {"error": str(error)})
         except (KeyError, json.JSONDecodeError) as error:
             self._send(400, {"error": "invalid_request", "detail": str(error)})
+
+    def _dispatch_bytes(self, callback):
+        try:
+            payload, media_type = callback()
+            self._send_bytes(200, payload, media_type)
+        except ValidationError as error:
+            self._send(400, {"error": str(error)})
+        except Conflict as error:
+            self._send(409, {"error": str(error)})
+        except NotFound as error:
+            self._send(404, {"error": str(error)})
+        except Unauthorized as error:
+            self._send(401, {"error": str(error)})
 
     def log_message(self, _format, *_args):
         return
@@ -243,6 +357,8 @@ def main():
         help="allow a verified server to listen on a container interface",
     )
     parser.add_argument("--port", type=int, default=8765)
+    parser.add_argument("--admin-listen", default="127.0.0.1")
+    parser.add_argument("--admin-port", type=int, default=8766)
     parser.add_argument("--database", default="profile-sync-dev.sqlite")
     parser.add_argument(
         "--unsafe-accept-signatures",
@@ -276,22 +392,53 @@ def main():
         Handler.mode = mode
         Handler.key_registry_path = None
         bootstrap_keys = {}
-    Handler.store = ProfileStore(
+    store = ProfileStore(
         Path(args.database),
         verify_signed_document=verifier,
         bootstrap_keys=bootstrap_keys,
     )
-    server = ThreadingHTTPServer((args.listen, args.port), Handler)
+    if args.admin_listen not in {"127.0.0.1", "::1"}:
+        raise SystemExit("admin listener must remain on loopback")
+
+    class ConsumerHandler(Handler):
+        pass
+
+    class AdminHandler(Handler):
+        pass
+
+    for handler, surface, handler_mode in (
+        (ConsumerHandler, "consumer", mode),
+        (AdminHandler, "admin", "verified-loopback-admin"),
+    ):
+        handler.store = store
+        handler.surface = surface
+        handler.mode = handler_mode
+        handler.key_registry_path = Handler.key_registry_path
+        if surface == "admin":
+            handler.max_request_bytes = 12 * 1024 * 1024
+
+    server = ThreadingHTTPServer((args.listen, args.port), ConsumerHandler)
+    admin_server = ThreadingHTTPServer(
+        (args.admin_listen, args.admin_port), AdminHandler
+    )
     if args.tls_cert:
         context = ssl.SSLContext(ssl.PROTOCOL_TLS_SERVER)
         context.minimum_version = ssl.TLSVersion.TLSv1_2
         context.load_cert_chain(args.tls_cert, args.tls_key)
         server.socket = context.wrap_socket(server.socket, server_side=True)
+    admin_thread = threading.Thread(
+        target=admin_server.serve_forever,
+        name="profile-sync-admin",
+        daemon=True,
+    )
+    admin_thread.start()
     try:
         server.serve_forever()
     except KeyboardInterrupt:
         pass
     finally:
+        admin_server.shutdown()
+        admin_server.server_close()
         server.server_close()
 
 
