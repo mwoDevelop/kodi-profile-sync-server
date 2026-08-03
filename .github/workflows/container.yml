@@ -39,7 +39,7 @@ jobs:
         with:
           context: .
           platforms: linux/amd64,linux/arm/v7
-          push: ${{ startsWith(github.ref, 'refs/tags/v') || inputs.publish_rc }}
+          push: ${{ startsWith(github.ref, 'refs/tags/v') || (github.event_name == 'workflow_dispatch' && inputs.publish_rc == true) }}
           tags: ghcr.io/mwodevelop/kodi-profile-sync-server:sha-${{ github.sha }}
           build-args: BUILD_REVISION=git:${{ github.sha }}
           cache-from: type=gha
