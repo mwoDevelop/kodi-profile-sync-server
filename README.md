@@ -23,6 +23,8 @@ Implemented:
 - promotion gated by successful reports from required enrollments;
 - TLS 1.2+ required for every non-loopback listener;
 - online, integrity-checked, mode-0600 SQLite backups and offline restore.
+- domain-separated `release_intent`, delegated `convergence_assignment` and
+  device-bound `convergence_report` contracts for the next rollout phase.
 
 The process can run on loopback for development. A non-loopback listener
 requires a schema 1 public-key registry, explicit opt-in and a TLS certificate
@@ -35,7 +37,14 @@ client certificate, and is attached only to the private `mwodevelop-control`
 Compose network. It never returns access tokens, public keys, signed documents,
 or mutation endpoints.
 
-Version 0.2.2 adds
+Version 0.5.0 adds fail-closed trust contracts for content-addressed convergence
+bundles. An offline promoter binds an exact bundle, channel, delegated assignment
+key, device allowlist and validity window. The online key cannot change those
+bounds, and a device report is bound to the exact assignment, enrollment
+generation, rollout and wave. Persistence and network endpoints remain disabled
+until their next separately reviewed increment.
+
+Version 0.2.2 added
 `POST /v1/channels/{channel}/bootstrap-assignments`. The endpoint accepts only
 an offline-promoter-signed document whose enrollment, channel, target tags and
 revision match an existing eligible enrollment and the channel's exact active
