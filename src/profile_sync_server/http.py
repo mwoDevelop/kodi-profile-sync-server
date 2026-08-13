@@ -115,6 +115,18 @@ class Handler(BaseHTTPRequestHandler):
             return
         parts = parsed.path.strip("/").split("/")
         if (
+            self.surface == "integration"
+            and parts == ["v1", "integration", "fleet"]
+        ):
+            self._dispatch(self.store.integration_fleet_snapshot)
+            return
+        if (
+            self.surface == "integration"
+            and parts == ["v1", "integration", "rollouts"]
+        ):
+            self._dispatch(self.store.integration_rollout_snapshot)
+            return
+        if (
             self.surface == "consumer"
             and
             len(parts) == 4
@@ -157,6 +169,9 @@ class Handler(BaseHTTPRequestHandler):
         self._send(404, {"error": "not_found"})
 
     def do_POST(self):
+        if self.surface == "integration":
+            self._send(405, {"error": "read_only"})
+            return
         parts = urlparse(self.path).path.strip("/").split("/")
         try:
             document = self._json()
@@ -359,6 +374,9 @@ def main():
     parser.add_argument("--port", type=int, default=8765)
     parser.add_argument("--admin-listen", default="127.0.0.1")
     parser.add_argument("--admin-port", type=int, default=8766)
+    parser.add_argument("--integration-listen")
+    parser.add_argument("--integration-port", type=int, default=8767)
+    parser.add_argument("--integration-client-ca")
     parser.add_argument("--database", default="profile-sync-dev.sqlite")
     parser.add_argument(
         "--unsafe-accept-signatures",
@@ -406,9 +424,13 @@ def main():
     class AdminHandler(Handler):
         pass
 
+    class IntegrationHandler(Handler):
+        pass
+
     for handler, surface, handler_mode in (
         (ConsumerHandler, "consumer", mode),
         (AdminHandler, "admin", "verified-loopback-admin"),
+        (IntegrationHandler, "integration", "verified-mtls-integration"),
     ):
         handler.store = store
         handler.surface = surface
@@ -421,6 +443,25 @@ def main():
     admin_server = ThreadingHTTPServer(
         (args.admin_listen, args.admin_port), AdminHandler
     )
+    integration_server = None
+    if bool(args.integration_listen) != bool(args.integration_client_ca):
+        raise SystemExit(
+            "provide --integration-listen and --integration-client-ca together"
+        )
+    if args.integration_listen:
+        if not args.tls_cert:
+            raise SystemExit("integration listener requires TLS certificate and key")
+        integration_server = ThreadingHTTPServer(
+            (args.integration_listen, args.integration_port), IntegrationHandler
+        )
+        integration_context = ssl.SSLContext(ssl.PROTOCOL_TLS_SERVER)
+        integration_context.minimum_version = ssl.TLSVersion.TLSv1_2
+        integration_context.load_cert_chain(args.tls_cert, args.tls_key)
+        integration_context.load_verify_locations(args.integration_client_ca)
+        integration_context.verify_mode = ssl.CERT_REQUIRED
+        integration_server.socket = integration_context.wrap_socket(
+            integration_server.socket, server_side=True
+        )
     if args.tls_cert:
         context = ssl.SSLContext(ssl.PROTOCOL_TLS_SERVER)
         context.minimum_version = ssl.TLSVersion.TLSv1_2
@@ -432,6 +473,14 @@ def main():
         daemon=True,
     )
     admin_thread.start()
+    integration_thread = None
+    if integration_server is not None:
+        integration_thread = threading.Thread(
+            target=integration_server.serve_forever,
+            name="profile-sync-integration",
+            daemon=True,
+        )
+        integration_thread.start()
     try:
         server.serve_forever()
     except KeyboardInterrupt:
@@ -439,6 +488,9 @@ def main():
     finally:
         admin_server.shutdown()
         admin_server.server_close()
+        if integration_server is not None:
+            integration_server.shutdown()
+            integration_server.server_close()
         server.server_close()
 
 

@@ -15,7 +15,7 @@ RUN python -m pip install --no-cache-dir .
 USER profilesync:profilesync
 ENV PROFILE_SYNC_BUILD=${BUILD_REVISION}
 VOLUME ["/data"]
-EXPOSE 8765 8766
+EXPOSE 8765 8766 8767
 
 HEALTHCHECK --interval=30s --timeout=5s --start-period=10s --retries=3 \
   CMD ["python", "-c", "import json,ssl,urllib.request; context=ssl._create_unverified_context(); assert json.load(urllib.request.urlopen('https://127.0.0.1:8765/ready', timeout=3, context=context))['status'] == 'ready'"]
