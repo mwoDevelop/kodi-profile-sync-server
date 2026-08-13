@@ -18,6 +18,8 @@ Implemented:
 - one-time, TTL-bound pairing codes;
 - per-installation enrollment generation, bearer token and signing key;
 - authenticated heartbeat and assignment lookup;
+- authenticated heartbeat capability/platform snapshots for control-plane reads;
+- a separate read-only mTLS integration surface for fleet and rollout snapshots;
 - promotion gated by successful reports from required enrollments;
 - TLS 1.2+ required for every non-loopback listener;
 - online, integrity-checked, mode-0600 SQLite backups and offline restore.
@@ -26,6 +28,12 @@ The process can run on loopback for development. A non-loopback listener
 requires a schema 1 public-key registry, explicit opt-in and a TLS certificate
 plus key. The unsafe flag replaces signature verification and is rejected for
 non-loopback operation.
+
+The optional integration listener is a distinct read-only surface. It exposes
+only `GET /v1/integration/fleet` and `GET /v1/integration/rollouts`, requires a
+client certificate, and is attached only to the private `mwodevelop-control`
+Compose network. It never returns access tokens, public keys, signed documents,
+or mutation endpoints.
 
 Version 0.2.2 adds
 `POST /v1/channels/{channel}/bootstrap-assignments`. The endpoint accepts only

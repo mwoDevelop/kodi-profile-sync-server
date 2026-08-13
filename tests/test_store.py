@@ -110,7 +110,15 @@ def test_restore_requires_valid_offline_backup_and_explicit_empty_target(tmp_pat
     result = ProfileStore.restore_backup(backup, target_path)
     assert result["sha256"] == hashlib.sha256(target_path.read_bytes()).hexdigest()
     restored = ProfileStore(target_path, lambda _kind, _document: True)
-    assert restored.readiness()["database_schema"] == 3
+    assert restored.readiness()["database_schema"] == 4
+
+    with pytest.raises(Conflict, match="restore target already exists"):
+        ProfileStore.restore_backup(backup, target_path)
+
+    corrupt = tmp_path / "corrupt.sqlite"
+    corrupt.write_bytes(b"not a sqlite database")
+    with pytest.raises(ValidationError, match="backup is not a valid SQLite"):
+        ProfileStore.restore_backup(corrupt, tmp_path / "bad.sqlite")
 
 
 def assignment_v2(
@@ -144,15 +152,6 @@ def assignment_v2(
         + hashlib.sha256(canonical_json(identity)).hexdigest(),
         "signature": "test-signature",
     }
-
-    with pytest.raises(Conflict, match="restore target already exists"):
-        ProfileStore.restore_backup(backup, target_path)
-
-    corrupt = tmp_path / "corrupt.sqlite"
-    corrupt.write_bytes(b"not a sqlite database")
-    with pytest.raises(ValidationError, match="backup is not a valid SQLite"):
-        ProfileStore.restore_backup(corrupt, tmp_path / "bad.sqlite")
-
 
 def test_revision_is_immutable_and_digest_verified(tmp_path):
     state = store(tmp_path)
@@ -468,6 +467,153 @@ def test_pairing_token_heartbeat_and_revocation(tmp_path):
             enrolled["enrollment_id"],
             enrolled["access_token"],
         )
+
+
+def test_heartbeat_persists_redacted_capability_snapshot(tmp_path):
+    state = ProfileStore(
+        tmp_path / "state.sqlite",
+        verify_signed_document=lambda _kind, _document: True,
+    )
+    pairing = state.create_pairing_code(
+        "x88-pro-20",
+        CHANNEL,
+        code="12345678",
+        ttl_seconds=60,
+        target_tags=["home", "android-tv:armeabi-v7a"],
+    )
+    enrolled = state.pair(
+        pairing["code"],
+        "x88-pro-20",
+        CHANNEL,
+        "x88-device-key",
+        "dQW21pY0MyWT7V8Qt1OH1J__hnMZs5VZFcjFNjkt5oU",
+    )
+    heartbeat_document = {
+        "enrollment_id": enrolled["enrollment_id"],
+        "logical_device_id": "x88-pro-20",
+        "enrollment_generation": 1,
+        "channel": CHANNEL,
+        "client_version": "1.1.0",
+        "client_capabilities": ["convergence:v1", "profile-sync:v3"],
+        "platform": "android-tv/armeabi-v7a",
+    }
+
+    state.heartbeat(heartbeat_document, enrolled["access_token"])
+    fleet = state.integration_fleet_snapshot(now=1234)
+
+    assert fleet["schema"] == 1
+    assert fleet["database_schema"] == 4
+    assert fleet["generated_at"] == 1234
+    assert fleet["devices"] == [
+        {
+            "enrollment_id": enrolled["enrollment_id"],
+            "logical_device_id": "x88-pro-20",
+            "enrollment_generation": 1,
+            "channel": CHANNEL,
+            "target_tags": ["android-tv:armeabi-v7a", "home"],
+            "revoked": False,
+            "created_at": fleet["devices"][0]["created_at"],
+            "last_seen_at": fleet["devices"][0]["last_seen_at"],
+            "client_version": "1.1.0",
+            "client_capabilities": ["convergence:v1", "profile-sync:v3"],
+            "platform": "android-tv/armeabi-v7a",
+            "heartbeat_document_sha256": hashlib.sha256(
+                canonical_json(heartbeat_document)
+            ).hexdigest(),
+        }
+    ]
+    serialized = str(fleet)
+    assert enrolled["access_token"] not in serialized
+    assert "public_key" not in serialized
+
+
+def test_legacy_heartbeat_remains_compatible_and_clears_no_secrets(tmp_path):
+    state = ProfileStore(
+        tmp_path / "state.sqlite",
+        verify_signed_document=lambda _kind, _document: True,
+    )
+    state.create_pairing_code(
+        "legacy-device", CHANNEL, code="12345678", ttl_seconds=60
+    )
+    enrolled = state.pair(
+        "12345678",
+        "legacy-device",
+        CHANNEL,
+        "legacy-device-key",
+        "dQW21pY0MyWT7V8Qt1OH1J__hnMZs5VZFcjFNjkt5oU",
+    )
+
+    state.heartbeat(
+        {
+            "enrollment_id": enrolled["enrollment_id"],
+            "logical_device_id": "legacy-device",
+            "enrollment_generation": 1,
+            "channel": CHANNEL,
+        },
+        enrolled["access_token"],
+    )
+
+    device = state.integration_fleet_snapshot()["devices"][0]
+    assert device["client_version"] is None
+    assert device["client_capabilities"] == []
+    assert device["platform"] is None
+
+
+def test_integration_rollout_snapshot_omits_signed_documents(tmp_path):
+    state = ProfileStore(
+        tmp_path / "state.sqlite",
+        verify_signed_document=lambda _kind, _document: True,
+    )
+    manifest = revision("integration-rollout")
+    state.put_revision(manifest)
+    state.publish_candidate(
+        CHANNEL,
+        manifest["revision_id"],
+        None,
+        None,
+        "publish-integration-rollout",
+    )
+    state.create_pairing_code(
+        "bluestacks1", CHANNEL, code="12345678", ttl_seconds=60
+    )
+    enrolled = state.pair(
+        "12345678",
+        "bluestacks1",
+        CHANNEL,
+        "bluestacks-device-key",
+        "dQW21pY0MyWT7V8Qt1OH1J__hnMZs5VZFcjFNjkt5oU",
+    )
+    assignment = assignment_v2(
+        enrolled["enrollment_id"],
+        1,
+        manifest["revision_id"],
+        "candidate",
+        0,
+    )
+    state.assign_candidate(assignment, "assign-integration-rollout")
+
+    snapshot = state.integration_rollout_snapshot(now=4321)
+
+    assert snapshot == {
+        "schema": 1,
+        "generated_at": 4321,
+        "assignments": [
+            {
+                "assignment_id": assignment["assignment_id"],
+                "assignment_kind": "candidate",
+                "enrollment_id": enrolled["enrollment_id"],
+                "logical_device_id": "bluestacks1",
+                "enrollment_generation": 1,
+                "channel": CHANNEL,
+                "revision_id": manifest["revision_id"],
+                "apply_policy": "enforce",
+                "issued_at": assignment["issued_at"],
+                "expires_at": assignment["expires_at"],
+                "report_result": None,
+            }
+        ],
+    }
+    assert "signature" not in str(snapshot)
 
 
 def test_assignment_target_tags_are_bound_to_enrollment(tmp_path):

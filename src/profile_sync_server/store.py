@@ -24,6 +24,8 @@ LOGICAL_DEVICE = re.compile(r"^[a-z0-9][a-z0-9._-]{0,63}$")
 PAIRING_CODE = re.compile(r"^[0-9]{8}$")
 KEY_ID = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._:-]{0,127}$")
 TARGET_TAG = re.compile(r"^[a-z0-9][a-z0-9._:-]{0,63}$")
+CLIENT_VERSION = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._+:-]{0,63}$")
+PLATFORM = re.compile(r"^[a-z0-9][a-z0-9._:/+-]{0,127}$")
 ASSIGNMENT_ID = re.compile(r"^sha256:[a-f0-9]{64}$")
 NONCE = re.compile(r"^[A-Za-z0-9._:-]{16,128}$")
 ROLES = {"read", "publish"}
@@ -316,6 +318,10 @@ class ProfileStore:
                     revoked INTEGER NOT NULL DEFAULT 0,
                     created_at INTEGER NOT NULL,
                     last_seen_at INTEGER,
+                    client_version TEXT,
+                    client_capabilities TEXT NOT NULL DEFAULT '[]',
+                    platform TEXT,
+                    heartbeat_document_sha256 TEXT,
                     UNIQUE(logical_device_id, generation)
                 );
                 """
@@ -329,6 +335,21 @@ class ProfileStore:
                     database.execute(
                         f"ALTER TABLE {table} ADD COLUMN "
                         "target_tags TEXT NOT NULL DEFAULT '[]'"
+                    )
+            enrollment_columns = {
+                row["name"]
+                for row in database.execute("PRAGMA table_info(enrollments)")
+            }
+            for column, declaration in (
+                ("client_version", "TEXT"),
+                ("client_capabilities", "TEXT NOT NULL DEFAULT '[]'"),
+                ("platform", "TEXT"),
+                ("heartbeat_document_sha256", "TEXT"),
+            ):
+                if column not in enrollment_columns:
+                    database.execute(
+                        "ALTER TABLE enrollments ADD COLUMN %s %s"
+                        % (column, declaration)
                     )
             database.execute(
                 "PRAGMA user_version=%d" % DATABASE_SCHEMA_VERSION
@@ -807,15 +828,150 @@ class ProfileStore:
             }
             if any(document.get(key) != value for key, value in expected.items()):
                 raise Unauthorized("heartbeat identity mismatch")
+            client_version = document.get("client_version")
+            if client_version is not None and (
+                not isinstance(client_version, str)
+                or not CLIENT_VERSION.fullmatch(client_version)
+            ):
+                raise ValidationError("invalid heartbeat client version")
+            capabilities = self._validate_target_tags(
+                document.get("client_capabilities", [])
+            )
+            platform = document.get("platform")
+            if platform is not None and (
+                not isinstance(platform, str) or not PLATFORM.fullmatch(platform)
+            ):
+                raise ValidationError("invalid heartbeat platform")
+            heartbeat_sha256 = hashlib.sha256(canonical_json(document)).hexdigest()
             database.execute(
-                "UPDATE enrollments SET last_seen_at=? WHERE enrollment_id=?",
-                (int(time.time()), enrollment_id),
+                """
+                UPDATE enrollments
+                SET last_seen_at=?, client_version=?, client_capabilities=?,
+                    platform=?, heartbeat_document_sha256=?
+                WHERE enrollment_id=?
+                """,
+                (
+                    int(time.time()),
+                    client_version,
+                    canonical_json(capabilities).decode("utf-8"),
+                    platform,
+                    heartbeat_sha256,
+                    enrollment_id,
+                ),
             )
         return {
             "enrollment_id": enrollment_id,
             "status": "ok",
             "revoked": False,
         }
+
+    def integration_fleet_snapshot(self, now=None):
+        """Return the redacted, authenticated fleet view for the control plane."""
+        now = int(time.time()) if now is None else int(now)
+        with self.connect() as database:
+            enrollments = database.execute(
+                """
+                SELECT enrollment_id, logical_device_id, generation, channel,
+                       target_tags, revoked, created_at, last_seen_at,
+                       client_version, client_capabilities, platform,
+                       heartbeat_document_sha256
+                FROM enrollments
+                ORDER BY logical_device_id, generation
+                """
+            ).fetchall()
+            channels = database.execute(
+                """
+                SELECT channel, candidate_revision, active_revision, generation
+                FROM channels ORDER BY channel
+                """
+            ).fetchall()
+        return {
+            "schema": 1,
+            "generated_at": now,
+            "database_schema": DATABASE_SCHEMA_VERSION,
+            "devices": [
+                {
+                    "enrollment_id": row["enrollment_id"],
+                    "logical_device_id": row["logical_device_id"],
+                    "enrollment_generation": row["generation"],
+                    "channel": row["channel"],
+                    "target_tags": self._validate_target_tags(
+                        json.loads(row["target_tags"])
+                    ),
+                    "revoked": bool(row["revoked"]),
+                    "created_at": row["created_at"],
+                    "last_seen_at": row["last_seen_at"],
+                    "client_version": row["client_version"],
+                    "client_capabilities": self._validate_target_tags(
+                        json.loads(row["client_capabilities"] or "[]")
+                    ),
+                    "platform": row["platform"],
+                    "heartbeat_document_sha256": row[
+                        "heartbeat_document_sha256"
+                    ],
+                }
+                for row in enrollments
+            ],
+            "channels": [dict(row) for row in channels],
+        }
+
+    def integration_rollout_snapshot(self, now=None):
+        """Return redacted assignment/report state without signed documents."""
+        now = int(time.time()) if now is None else int(now)
+        with self.connect() as database:
+            assignments = database.execute(
+                """
+                SELECT a.enrollment_id, e.logical_device_id, e.generation,
+                       a.channel, a.revision_id, a.assignment_kind, a.document
+                FROM assignments AS a
+                LEFT JOIN enrollments AS e
+                  ON e.enrollment_id = a.enrollment_id
+                ORDER BY a.channel, e.logical_device_id, a.enrollment_id
+                """
+            ).fetchall()
+            assignment_reports = {
+                row["assignment_id"]: row
+                for row in database.execute(
+                    """
+                    SELECT assignment_id, result FROM assignment_reports
+                    ORDER BY assignment_id
+                    """
+                )
+            }
+            legacy_reports = {
+                (row["enrollment_id"], row["channel"], row["revision_id"]): row
+                for row in database.execute(
+                    """
+                    SELECT enrollment_id, channel, revision_id, result
+                    FROM reports
+                    """
+                )
+            }
+        result = []
+        for row in assignments:
+            document = json.loads(row["document"])
+            assignment_id = document.get("assignment_id")
+            report = assignment_reports.get(assignment_id)
+            if report is None:
+                report = legacy_reports.get(
+                    (row["enrollment_id"], row["channel"], row["revision_id"])
+                )
+            result.append(
+                {
+                    "assignment_id": assignment_id,
+                    "assignment_kind": row["assignment_kind"],
+                    "enrollment_id": row["enrollment_id"],
+                    "logical_device_id": row["logical_device_id"],
+                    "enrollment_generation": row["generation"],
+                    "channel": row["channel"],
+                    "revision_id": row["revision_id"],
+                    "apply_policy": document.get("apply_policy"),
+                    "issued_at": document.get("issued_at"),
+                    "expires_at": document.get("expires_at"),
+                    "report_result": report["result"] if report else None,
+                }
+            )
+        return {"schema": 1, "generated_at": now, "assignments": result}
 
     def revoke_enrollment(self, enrollment_id):
         with self.connect() as database:
