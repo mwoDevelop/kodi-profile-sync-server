@@ -12,7 +12,7 @@ import ctypes
 import ctypes.util
 import json
 import re
-import ssl  # Load the process SSL backend before probing exported symbols.
+import ssl  # noqa: F401  # Load SSL backend before probing exported symbols.
 from pathlib import Path
 
 from .store import canonical_json
@@ -26,7 +26,10 @@ KINDS = {
     "admin_promote",
     "admin_publish",
     "assignment",
+    "convergence_assignment",
+    "convergence_report",
     "promotion",
+    "release_intent",
     "report",
     "revision",
 }
@@ -60,9 +63,7 @@ def _b64url_decode(value, expected_size):
         raise SignatureFormatError("signature value is not canonical base64url")
     padding = "=" * (-len(value) % 4)
     try:
-        payload = base64.b64decode(
-            value + padding, altchars=b"-_", validate=True
-        )
+        payload = base64.b64decode(value + padding, altchars=b"-_", validate=True)
     except (ValueError, base64.binascii.Error) as error:
         raise SignatureFormatError("signature value is not base64url") from error
     if len(payload) != expected_size:
@@ -77,9 +78,7 @@ def signed_payload(kind, document):
         raise SignatureFormatError("unsupported signed-document kind")
     if not isinstance(document, dict):
         raise SignatureFormatError("signed document must be an object")
-    unsigned = {
-        key: value for key, value in document.items() if key != "signature"
-    }
+    unsigned = {key: value for key, value in document.items() if key != "signature"}
     return DOMAIN + kind.encode("ascii") + b"\0" + canonical_json(unsigned)
 
 
@@ -241,13 +240,9 @@ class _OpenSSL:
         try:
             output = (ctypes.c_ubyte * 32)()
             output_size = ctypes.c_size_t(len(output))
-            if (
-                self.library.EVP_PKEY_get_raw_public_key(
-                    key, output, ctypes.byref(output_size)
-                )
-                != 1
-                or output_size.value != len(output)
-            ):
+            if self.library.EVP_PKEY_get_raw_public_key(
+                key, output, ctypes.byref(output_size)
+            ) != 1 or output_size.value != len(output):
                 raise CryptoUnavailable("EVP_PKEY_get_raw_public_key failed")
             return bytes(output)
         finally:
@@ -260,26 +255,17 @@ class _OpenSSL:
             self.library.EVP_PKEY_free(key)
             raise CryptoUnavailable("EVP_MD_CTX_new failed")
         try:
-            if (
-                self.library.EVP_DigestSignInit(
-                    context, None, None, None, key
-                )
-                != 1
-            ):
+            if self.library.EVP_DigestSignInit(context, None, None, None, key) != 1:
                 raise CryptoUnavailable("EVP_DigestSignInit failed")
             output = (ctypes.c_ubyte * 64)()
             output_size = ctypes.c_size_t(len(output))
-            if (
-                self.library.EVP_DigestSign(
-                    context,
-                    output,
-                    ctypes.byref(output_size),
-                    _message_buffer(message),
-                    len(message),
-                )
-                != 1
-                or output_size.value != len(output)
-            ):
+            if self.library.EVP_DigestSign(
+                context,
+                output,
+                ctypes.byref(output_size),
+                _message_buffer(message),
+                len(message),
+            ) != 1 or output_size.value != len(output):
                 raise CryptoUnavailable("EVP_DigestSign failed")
             return bytes(output)
         finally:
@@ -299,12 +285,7 @@ class _OpenSSL:
             self.library.EVP_PKEY_free(key)
             raise CryptoUnavailable("EVP_MD_CTX_new failed")
         try:
-            if (
-                self.library.EVP_DigestVerifyInit(
-                    context, None, None, None, key
-                )
-                != 1
-            ):
+            if self.library.EVP_DigestVerifyInit(context, None, None, None, key) != 1:
                 raise CryptoUnavailable("EVP_DigestVerifyInit failed")
             return (
                 self.library.EVP_DigestVerify(
@@ -380,9 +361,7 @@ def decode_public_key(value):
     return _b64url_decode(value, 32)
 
 
-def verify_document_with_key(
-    kind, document, expected_key_id, public_key, backend=None
-):
+def verify_document_with_key(kind, document, expected_key_id, public_key, backend=None):
     try:
         signature = document.get("signature")
         if not isinstance(signature, dict) or set(signature) != SIGNATURE_FIELDS:
@@ -438,9 +417,7 @@ class SignedDocumentVerifier:
         return {
             key_id: {
                 "public_key": _b64url_encode(record["public_key"]),
-                "allowed_kinds": sorted(
-                    record["allowed_kinds"].intersection(allowed)
-                ),
+                "allowed_kinds": sorted(record["allowed_kinds"].intersection(allowed)),
             }
             for key_id, record in self.keys.items()
             if record["allowed_kinds"].intersection(allowed)
