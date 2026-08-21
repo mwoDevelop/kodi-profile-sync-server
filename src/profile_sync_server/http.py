@@ -14,7 +14,7 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from urllib.parse import parse_qs, urlparse
 
-from .broker import BrokerUnavailable, SecretBrokerClient
+from .broker import BrokerNotFound, BrokerUnavailable, SecretBrokerClient
 from .crypto import SignedDocumentVerifier
 from .metadata import runtime_metadata
 from .store import (
@@ -350,6 +350,8 @@ class Handler(BaseHTTPRequestHandler):
             self._send(401, {"error": str(error)})
         except BrokerUnavailable:
             self._send(503, {"error": "secret_broker_unavailable"})
+        except BrokerNotFound:
+            self._send(404, {"error": "secret_not_available"})
         except (KeyError, json.JSONDecodeError) as error:
             self._send(400, {"error": "invalid_request", "detail": str(error)})
 

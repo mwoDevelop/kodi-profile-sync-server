@@ -12,6 +12,10 @@ class BrokerUnavailable(RuntimeError):
     pass
 
 
+class BrokerNotFound(RuntimeError):
+    pass
+
+
 class SecretBrokerClient:
     def __init__(self, base_url, ca, certificate, private_key, timeout=10):
         if not str(base_url).startswith("https://"):
@@ -37,6 +41,11 @@ class SecretBrokerClient:
         )
         try:
             response = self.opener.open(request, timeout=self.timeout)
+        except urllib.error.HTTPError as error:
+            error.read(128 * 1024 + 1)
+            if error.code == 404:
+                raise BrokerNotFound("Secret Broker has no deliverable secret") from error
+            raise BrokerUnavailable("Secret Broker is unavailable") from error
         except (OSError, urllib.error.URLError) as error:
             raise BrokerUnavailable("Secret Broker is unavailable") from error
         with response:
