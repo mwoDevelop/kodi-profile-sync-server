@@ -840,6 +840,52 @@ class ProfileStore:
                 "delivery_mode": delivery_mode,
             }
 
+    def register_encryption_key(
+        self,
+        enrollment_id,
+        access_token,
+        enrollment_generation,
+        encryption_key_id,
+        encryption_public_key,
+    ):
+        if not isinstance(encryption_key_id, str) or not KEY_ID.fullmatch(
+            encryption_key_id
+        ):
+            raise ValidationError("invalid encryption key id")
+        from .crypto import _b64url_decode
+
+        _b64url_decode(encryption_public_key, 32)
+        with self.connect() as database:
+            database.execute("BEGIN IMMEDIATE")
+            enrollment = self._authenticate(database, enrollment_id, access_token)
+            if enrollment["generation"] != enrollment_generation:
+                raise Conflict("enrollment generation differs")
+            existing = (
+                enrollment["encryption_key_id"],
+                enrollment["encryption_public_key"],
+            )
+            requested = (encryption_key_id, encryption_public_key)
+            if existing == requested:
+                return {
+                    "enrollment_id": enrollment_id,
+                    "enrollment_generation": enrollment_generation,
+                    "encryption_key_id": encryption_key_id,
+                    "status": "unchanged",
+                }
+            if any(existing):
+                raise Conflict("enrollment encryption key already exists")
+            database.execute(
+                "UPDATE enrollments SET encryption_key_id=?, "
+                "encryption_public_key=? WHERE enrollment_id=?",
+                (encryption_key_id, encryption_public_key, enrollment_id),
+            )
+        return {
+            "enrollment_id": enrollment_id,
+            "enrollment_generation": enrollment_generation,
+            "encryption_key_id": encryption_key_id,
+            "status": "registered",
+        }
+
     def _authenticate(self, database, enrollment_id, access_token, role="read"):
         if (
             not isinstance(enrollment_id, str)

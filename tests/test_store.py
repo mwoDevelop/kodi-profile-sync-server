@@ -570,6 +570,44 @@ def test_secret_envelope_identity_requires_encryption_capability(tmp_path):
     }
 
 
+def test_existing_enrollment_registers_encryption_key_once(tmp_path):
+    state = store(tmp_path)
+    pairing = state.create_pairing_code(
+        "legacy-device", CHANNEL, code="12345678", ttl_seconds=60
+    )
+    enrolled = state.pair(
+        pairing["code"],
+        "legacy-device",
+        CHANNEL,
+        "legacy-signing-key",
+        "dQW21pY0MyWT7V8Qt1OH1J__hnMZs5VZFcjFNjkt5oU",
+    )
+    public = "hSDwCYkwp1R0i33ctD73Wg2_Og0mOBr066SpjqqbTmo"
+    result = state.register_encryption_key(
+        enrolled["enrollment_id"],
+        enrolled["access_token"],
+        1,
+        "legacy-encryption-key",
+        public,
+    )
+    assert result["status"] == "registered"
+    assert state.register_encryption_key(
+        enrolled["enrollment_id"],
+        enrolled["access_token"],
+        1,
+        "legacy-encryption-key",
+        public,
+    )["status"] == "unchanged"
+    with pytest.raises(Conflict, match="already exists"):
+        state.register_encryption_key(
+            enrolled["enrollment_id"],
+            enrolled["access_token"],
+            1,
+            "different-encryption-key",
+            public,
+        )
+
+
 def test_legacy_heartbeat_remains_compatible_and_clears_no_secrets(tmp_path):
     state = ProfileStore(
         tmp_path / "state.sqlite",

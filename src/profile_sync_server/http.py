@@ -216,6 +216,21 @@ class Handler(BaseHTTPRequestHandler):
             self._dispatch(
                 lambda: self.store.heartbeat(document, self._bearer())
             )
+        elif (
+            self.surface == "consumer"
+            and len(parts) == 4
+            and parts[:2] == ["v1", "enrollments"]
+            and parts[3] == "encryption-key"
+        ):
+            self._dispatch(
+                lambda: self.store.register_encryption_key(
+                    parts[2],
+                    self._bearer(),
+                    document["enrollment_generation"],
+                    document["encryption_key_id"],
+                    document["encryption_public_key"],
+                )
+            )
         elif self.surface == "admin" and parts == ["v1", "revisions"]:
             self._dispatch(
                 lambda: self.store.put_revision(
