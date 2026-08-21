@@ -202,7 +202,7 @@ def main():
             health = wait_ready(base, process)
             expected_health = {
                 "api_version": "v1",
-                "database_schema": 4,
+                "database_schema": 5,
                 "mode": "verified-loopback",
                 "service": "kodi-profile-sync-server",
                 "status": "ok",
@@ -216,7 +216,7 @@ def main():
             status, ready = request(base, "GET", "/ready")
             expected_ready = {
                 "database": "ready",
-                "database_schema": 4,
+                "database_schema": 5,
                 "key_registry": "ready",
                 "mode": "verified-loopback",
                 "status": "ready",
