@@ -815,7 +815,11 @@ class ProfileStore:
             ),
         }
 
-    def secret_envelope_request(self, enrollment_id, access_token):
+    def secret_envelope_request(
+        self, enrollment_id, access_token, delivery_mode="shadow"
+    ):
+        if delivery_mode not in {"shadow", "canary", "active"}:
+            raise ValidationError("invalid secret delivery mode")
         with self.connect() as database:
             enrollment = self._authenticate(
                 database, enrollment_id, access_token
@@ -833,6 +837,7 @@ class ProfileStore:
                 "enrollment_generation": enrollment["generation"],
                 "encryption_key_id": enrollment["encryption_key_id"],
                 "encryption_public_key": enrollment["encryption_public_key"],
+                "delivery_mode": delivery_mode,
             }
 
     def _authenticate(self, database, enrollment_id, access_token, role="read"):

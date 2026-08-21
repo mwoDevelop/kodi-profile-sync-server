@@ -137,10 +137,12 @@ class Handler(BaseHTTPRequestHandler):
             if self.secret_broker is None:
                 self._send(404, {"error": "secret_broker_not_configured"})
                 return
+            query = parse_qs(parsed.query)
+            delivery_mode = query.get("mode", ["shadow"])[0]
             self._dispatch(
                 lambda: self.secret_broker.envelope(
                     self.store.secret_envelope_request(
-                        parts[2], self._bearer()
+                        parts[2], self._bearer(), delivery_mode
                     )
                 )
             )

@@ -566,7 +566,10 @@ def test_secret_envelope_identity_requires_encryption_capability(tmp_path):
         "enrollment_generation": 1,
         "encryption_key_id": "x88-encryption-key",
         "encryption_public_key": "hSDwCYkwp1R0i33ctD73Wg2_Og0mOBr066SpjqqbTmo",
+        "delivery_mode": "shadow",
     }
+
+
 def test_legacy_heartbeat_remains_compatible_and_clears_no_secrets(tmp_path):
     state = ProfileStore(
         tmp_path / "state.sqlite",
