@@ -14,6 +14,7 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from urllib.parse import parse_qs, urlparse
 
+from .broker import BrokerUnavailable, SecretBrokerClient
 from .crypto import SignedDocumentVerifier
 from .metadata import runtime_metadata
 from .store import (
@@ -31,6 +32,7 @@ class Handler(BaseHTTPRequestHandler):
     key_registry_path = None
     surface = "unconfigured"
     max_request_bytes = 1024 * 1024
+    secret_broker = None
 
     def _json(self):
         try:
@@ -128,6 +130,25 @@ class Handler(BaseHTTPRequestHandler):
             return
         if (
             self.surface == "consumer"
+            and len(parts) == 5
+            and parts[:2] == ["v1", "enrollments"]
+            and parts[3:] == ["secrets", "youtube-session-v1"]
+        ):
+            if self.secret_broker is None:
+                self._send(404, {"error": "secret_broker_not_configured"})
+                return
+            query = parse_qs(parsed.query)
+            delivery_mode = query.get("mode", ["shadow"])[0]
+            self._dispatch(
+                lambda: self.secret_broker.envelope(
+                    self.store.secret_envelope_request(
+                        parts[2], self._bearer(), delivery_mode
+                    )
+                )
+            )
+            return
+        if (
+            self.surface == "consumer"
             and
             len(parts) == 4
             and parts[:2] == ["v1", "enrollments"]
@@ -187,11 +208,28 @@ class Handler(BaseHTTPRequestHandler):
                     document["channel"],
                     document["key_id"],
                     document["public_key"],
+                    document.get("encryption_key_id"),
+                    document.get("encryption_public_key"),
                 )
             )
         elif self.surface == "consumer" and parts == ["v1", "devices", "heartbeat"]:
             self._dispatch(
                 lambda: self.store.heartbeat(document, self._bearer())
+            )
+        elif (
+            self.surface == "consumer"
+            and len(parts) == 4
+            and parts[:2] == ["v1", "enrollments"]
+            and parts[3] == "encryption-key"
+        ):
+            self._dispatch(
+                lambda: self.store.register_encryption_key(
+                    parts[2],
+                    self._bearer(),
+                    document["enrollment_generation"],
+                    document["encryption_key_id"],
+                    document["encryption_public_key"],
+                )
             )
         elif self.surface == "admin" and parts == ["v1", "revisions"]:
             self._dispatch(
@@ -310,6 +348,8 @@ class Handler(BaseHTTPRequestHandler):
             self._send(404, {"error": str(error)})
         except Unauthorized as error:
             self._send(401, {"error": str(error)})
+        except BrokerUnavailable:
+            self._send(503, {"error": "secret_broker_unavailable"})
         except (KeyError, json.JSONDecodeError) as error:
             self._send(400, {"error": "invalid_request", "detail": str(error)})
 
@@ -389,6 +429,10 @@ def main():
     )
     parser.add_argument("--tls-cert", help="PEM TLS certificate chain")
     parser.add_argument("--tls-key", help="PEM TLS private key")
+    parser.add_argument("--secret-broker-url")
+    parser.add_argument("--secret-broker-ca")
+    parser.add_argument("--secret-broker-cert")
+    parser.add_argument("--secret-broker-key")
     args = parser.parse_args()
     mode = transport_mode(
         listen=args.listen,
@@ -415,6 +459,17 @@ def main():
         verify_signed_document=verifier,
         bootstrap_keys=bootstrap_keys,
     )
+    broker_values = (
+        args.secret_broker_url,
+        args.secret_broker_ca,
+        args.secret_broker_cert,
+        args.secret_broker_key,
+    )
+    if any(broker_values) and not all(broker_values):
+        raise SystemExit("provide all Secret Broker mTLS options together")
+    secret_broker = (
+        SecretBrokerClient(*broker_values) if all(broker_values) else None
+    )
     if args.admin_listen not in {"127.0.0.1", "::1"}:
         raise SystemExit("admin listener must remain on loopback")
 
@@ -436,6 +491,7 @@ def main():
         handler.surface = surface
         handler.mode = handler_mode
         handler.key_registry_path = Handler.key_registry_path
+        handler.secret_broker = secret_broker
         if surface == "admin":
             handler.max_request_bytes = 12 * 1024 * 1024
 

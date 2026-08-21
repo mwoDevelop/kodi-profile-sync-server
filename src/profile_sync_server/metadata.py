@@ -9,7 +9,7 @@ from importlib.metadata import PackageNotFoundError, version
 
 SERVICE_ID = "kodi-profile-sync-server"
 API_VERSION = "v1"
-DATABASE_SCHEMA_VERSION = 4
+DATABASE_SCHEMA_VERSION = 5
 SAFE_BUILD = re.compile(r"^[A-Za-z0-9._:@+-]{1,128}$")
 
 

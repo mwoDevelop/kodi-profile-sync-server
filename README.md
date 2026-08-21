@@ -3,6 +3,12 @@
 Verified implementation of the mwoDevelop Kodi profile synchronization store
 and HTTPS API.
 
+Wersja 0.6 dodaje rozszerzalny transport opaque secret envelopes. Pairing może
+zarejestrować osobny publiczny klucz X25519 enrollmentu, a consumer API
+`GET /v1/enrollments/{id}/secrets/youtube-session-v1` przekazuje wyłącznie
+kopertę przygotowaną przez wewnętrzny Secret Broker. Serwer nie odszyfrowuje i
+nie zapisuje credentiali YouTube.
+
 Implemented:
 
 - immutable schema 2 revisions;

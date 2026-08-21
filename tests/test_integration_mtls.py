@@ -140,7 +140,7 @@ def test_integration_surface_requires_mtls_and_is_read_only(tmp_path):
         assert fleet == {
             "schema": 1,
             "generated_at": fleet["generated_at"],
-            "database_schema": 4,
+            "database_schema": 5,
             "devices": [],
             "channels": [],
         }
