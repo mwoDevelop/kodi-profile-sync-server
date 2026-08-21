@@ -110,7 +110,7 @@ def test_restore_requires_valid_offline_backup_and_explicit_empty_target(tmp_pat
     result = ProfileStore.restore_backup(backup, target_path)
     assert result["sha256"] == hashlib.sha256(target_path.read_bytes()).hexdigest()
     restored = ProfileStore(target_path, lambda _kind, _document: True)
-    assert restored.readiness()["database_schema"] == 4
+    assert restored.readiness()["database_schema"] == 5
 
     with pytest.raises(Conflict, match="restore target already exists"):
         ProfileStore.restore_backup(backup, target_path)
@@ -502,7 +502,7 @@ def test_heartbeat_persists_redacted_capability_snapshot(tmp_path):
     fleet = state.integration_fleet_snapshot(now=1234)
 
     assert fleet["schema"] == 1
-    assert fleet["database_schema"] == 4
+    assert fleet["database_schema"] == 5
     assert fleet["generated_at"] == 1234
     assert fleet["devices"] == [
         {
@@ -527,6 +527,46 @@ def test_heartbeat_persists_redacted_capability_snapshot(tmp_path):
     assert "public_key" not in serialized
 
 
+def test_secret_envelope_identity_requires_encryption_capability(tmp_path):
+    state = store(tmp_path)
+    pairing = state.create_pairing_code(
+        "x88-pro-20", CHANNEL, code="12345678", ttl_seconds=60
+    )
+    enrolled = state.pair(
+        pairing["code"],
+        "x88-pro-20",
+        CHANNEL,
+        "x88-signing-key",
+        "dQW21pY0MyWT7V8Qt1OH1J__hnMZs5VZFcjFNjkt5oU",
+        "x88-encryption-key",
+        "hSDwCYkwp1R0i33ctD73Wg2_Og0mOBr066SpjqqbTmo",
+    )
+    with pytest.raises(Conflict, match="has not reported"):
+        state.secret_envelope_request(
+            enrolled["enrollment_id"], enrolled["access_token"]
+        )
+
+    state.heartbeat(
+        {
+            "enrollment_id": enrolled["enrollment_id"],
+            "logical_device_id": "x88-pro-20",
+            "enrollment_generation": 1,
+            "channel": CHANNEL,
+            "client_version": "1.1.0",
+            "client_capabilities": ["secret-envelope-v1"],
+        },
+        enrolled["access_token"],
+    )
+    identity = state.secret_envelope_request(
+        enrolled["enrollment_id"], enrolled["access_token"]
+    )
+    assert identity == {
+        "logical_device_id": "x88-pro-20",
+        "enrollment_id": enrolled["enrollment_id"],
+        "enrollment_generation": 1,
+        "encryption_key_id": "x88-encryption-key",
+        "encryption_public_key": "hSDwCYkwp1R0i33ctD73Wg2_Og0mOBr066SpjqqbTmo",
+    }
 def test_legacy_heartbeat_remains_compatible_and_clears_no_secrets(tmp_path):
     state = ProfileStore(
         tmp_path / "state.sqlite",

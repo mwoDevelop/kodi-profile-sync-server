@@ -313,6 +313,8 @@ class ProfileStore:
                     roles TEXT NOT NULL,
                     key_id TEXT NOT NULL UNIQUE,
                     public_key TEXT NOT NULL,
+                    encryption_key_id TEXT,
+                    encryption_public_key TEXT,
                     token_sha256 TEXT NOT NULL,
                     target_tags TEXT NOT NULL DEFAULT '[]',
                     revoked INTEGER NOT NULL DEFAULT 0,
@@ -345,6 +347,8 @@ class ProfileStore:
                 ("client_capabilities", "TEXT NOT NULL DEFAULT '[]'"),
                 ("platform", "TEXT"),
                 ("heartbeat_document_sha256", "TEXT"),
+                ("encryption_key_id", "TEXT"),
+                ("encryption_public_key", "TEXT"),
             ):
                 if column not in enrollment_columns:
                     database.execute(
@@ -699,6 +703,8 @@ class ProfileStore:
         channel,
         key_id,
         public_key,
+        encryption_key_id=None,
+        encryption_public_key=None,
     ):
         if not isinstance(code, str) or not PAIRING_CODE.fullmatch(code):
             raise Unauthorized("pairing rejected")
@@ -711,6 +717,14 @@ class ProfileStore:
         from .crypto import _b64url_decode
 
         _b64url_decode(public_key, 32)
+        if (encryption_key_id is None) != (encryption_public_key is None):
+            raise ValidationError("encryption key pair metadata is incomplete")
+        if encryption_key_id is not None:
+            if not isinstance(encryption_key_id, str) or not KEY_ID.fullmatch(
+                encryption_key_id
+            ):
+                raise ValidationError("invalid encryption key id")
+            _b64url_decode(encryption_public_key, 32)
         now = int(time.time())
         with self.connect() as database:
             database.execute("BEGIN IMMEDIATE")
@@ -756,9 +770,10 @@ class ProfileStore:
                     """
                     INSERT INTO enrollments (
                         enrollment_id, logical_device_id, generation, channel,
-                        roles, key_id, public_key, token_sha256, target_tags,
+                        roles, key_id, public_key, encryption_key_id,
+                        encryption_public_key, token_sha256, target_tags,
                         revoked, created_at, last_seen_at
-                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, 0, ?, NULL)
+                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 0, ?, NULL)
                     """,
                     (
                         enrollment_id,
@@ -768,6 +783,8 @@ class ProfileStore:
                         canonical_json(roles).decode("utf-8"),
                         key_id,
                         public_key,
+                        encryption_key_id,
+                        encryption_public_key,
                         self._token_digest(access_token),
                         canonical_json(target_tags).decode("utf-8"),
                         now,
@@ -788,7 +805,35 @@ class ProfileStore:
             "target_tags": target_tags,
             "access_token": access_token,
             "trust": self.bootstrap_keys,
+            "encryption": (
+                {
+                    "key_id": encryption_key_id,
+                    "suite": "DHKEM_X25519_HKDF_SHA256",
+                }
+                if encryption_key_id is not None
+                else None
+            ),
         }
+
+    def secret_envelope_request(self, enrollment_id, access_token):
+        with self.connect() as database:
+            enrollment = self._authenticate(
+                database, enrollment_id, access_token
+            )
+            if not enrollment["encryption_key_id"] or not enrollment[
+                "encryption_public_key"
+            ]:
+                raise Conflict("enrollment has no encryption capability")
+            capabilities = json.loads(enrollment["client_capabilities"])
+            if "secret-envelope-v1" not in capabilities:
+                raise Conflict("client has not reported secret-envelope-v1")
+            return {
+                "logical_device_id": enrollment["logical_device_id"],
+                "enrollment_id": enrollment["enrollment_id"],
+                "enrollment_generation": enrollment["generation"],
+                "encryption_key_id": enrollment["encryption_key_id"],
+                "encryption_public_key": enrollment["encryption_public_key"],
+            }
 
     def _authenticate(self, database, enrollment_id, access_token, role="read"):
         if (
